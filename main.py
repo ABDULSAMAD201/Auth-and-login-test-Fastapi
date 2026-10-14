@@ -58,12 +58,17 @@ def initialize_database() -> None:
             if column not in existing:
                 connection.execute(f"ALTER TABLE users ADD COLUMN {column} {ddl}")
 
+
+# i made this function to hash passwords using scrypt, which is a secure password hashing algorithm. It generates a random salt and uses it to hash the password, 
+# returning a string that includes the algorithm, salt, and hash. This allows for secure storage of passwords in the database.
 def hash_password(password: str) -> str:
     salt = secrets.token_bytes(16)
     digest = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1)
     return f"scrypt${salt.hex()}${digest.hex()}"
 
 
+# rehashes the password and compares it to the stored hash using a constant-time comparison to prevent timing attacks. 
+# It returns True if the password is correct, and False otherwise.
 def verify_password(password: str, encoded: str) -> bool:
     try:
         algorithm, salt_hex, digest_hex = encoded.split("$")
@@ -84,7 +89,8 @@ def create_csrf_token(request: Request) -> str:
         request.session["csrf_token"] = token
     return token
 
-
+#now we are defining a function called csrf_is_valid that checks 
+# if the CSRF token submitted in a form matches the expected token stored in the user's session.
 def csrf_is_valid(request: Request, form: object) -> bool:
     submitted = str(form.get("csrf_token", ""))
     expected = str(request.session.get("csrf_token", ""))
@@ -111,32 +117,46 @@ def render(
         status_code=status_code,
     )
 
-
+#this function retrieves a user from the database based on their email address.
+#It connects to the database, executes a query to select the user with the specified email, 
+#and returns the result as a sqlite3.Row object. If no user is found, it returns None.
 def get_user(email: str) -> sqlite3.Row | None:
     with connect_db() as connection:
         return connection.execute(
-            "SELECT email, password_hash FROM users WHERE email = ?", (email,)
+            "SELECT * FROM users WHERE email = ?", (email,)
         ).fetchone()
 
 
-def signed_in_user(request: Request) -> sqlite3.Row | None:
+#It checks the session for the user's email and expiration time, 
+# and verifies that the session version matches the user's session version in the database. If any of these checks fail, 
+# it clears the session and returns None. Otherwise, it returns the user object.
+def signed_in_user(request: Request):
     email = request.session.get("email")
     expires_at = request.session.get("expires_at", 0)
     if not email or not isinstance(expires_at, int) or expires_at <= int(time.time()):
         request.session.clear()
         return None
-    return get_user(email)
+    user = get_user(email)
+    if not user or request.session.get("sv") != user["session_version"]:
+        request.session.clear()
+        return None
+    return user
 
-
+#sends people to /login .Status code 303 means "See Other",
+#which tells the client to make a GET request to the new URL.
 def redirect_to_login(message: str = "") -> RedirectResponse:
     suffix = f"?{urlencode({'message': message})}" if message else ""
     return RedirectResponse(f"/login{suffix}", status_code=303)
 
 
+#configures reCAPTCHA by checking 
+#if the necessary environment variables for the site key and secret key are set.
 def recaptcha_configured() -> bool:
     return bool(os.getenv("RECAPTCHA_SITE_KEY") and os.getenv("RECAPTCHA_SECRET_KEY"))
 
 
+#asks google to verify the reCAPTCHA token submitted by the user.
+#It sends a POST request to the Google reCAPTCHA API with the secret key, the user's response token, and the user's IP address.
 async def recaptcha_is_valid(token: str, remote_ip: str | None) -> bool:
     if not recaptcha_configured():
         return APP_ENV != "production"
@@ -156,8 +176,11 @@ async def recaptcha_is_valid(token: str, remote_ip: str | None) -> bool:
     except (httpx.HTTPError, ValueError):
         logger.exception("reCAPTCHA verification failed")
         return False
+    
 
-
+#emails the link or logs it in development mode. It checks if the SMTP_HOST environment variable is set,
+#and if not, it logs a warning or error message depending on the environment. If the SMTP_HOST is set, 
+# it creates an email message with the reset link and sends it using the SMTP protocol.
 def send_reset_email(email: str, reset_url: str) -> None:
     if not os.getenv("SMTP_HOST"):
         if APP_ENV != "production":
@@ -186,6 +209,9 @@ async def lifespan(_: FastAPI):
     yield
 
 
+#session middleware makes request.session work with cookie signed secret key.
+#It also sets the session cookie name, max age, same site policy, 
+#and whether it should be sent over HTTPS only in production.
 app = FastAPI(title="Sign-In Portal", lifespan=lifespan)
 app.add_middleware(
     SessionMiddleware,
@@ -198,6 +224,8 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
+
+#OAuth registration sets up google. Security headers adds browser protections.
 oauth = OAuth()
 if os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET"):
     oauth.register(
@@ -261,6 +289,9 @@ async def login(request: Request):
     return RedirectResponse("/", status_code=303)
 
 
+#checks the csrf token submitted in the form against the expected token stored in the user's session.
+#If the tokens do not match, it redirects the user to the login page with an error message. 
+# If the tokens match, it clears the user's session and redirects them to the login page with a success message.
 @app.post("/logout")
 async def logout(request: Request):
     form = await request.form()
@@ -270,6 +301,7 @@ async def logout(request: Request):
     return RedirectResponse("/login", status_code=303)
 
 
+#an endpoint to handle GET requests to the /forgot-password URL. It renders the forgot_password.html template, which contains a form for users to request a password reset.
 @app.get("/forgot-password", response_class=HTMLResponse)
 async def forgot_password_page(request: Request):
     return render(request, "forgot_password.html")
