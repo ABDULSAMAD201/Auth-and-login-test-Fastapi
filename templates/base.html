@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f4ee">
+  <title>{% block title %}Sign in{% endblock %} | Northstar</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}">
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <main class="shell">
+    <aside class="brand-panel">
+      <div class="brand-lockup">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 36 36" fill="none"><path d="M18 3.5 31 10v9.1c0 7.1-5.3 11.8-13 14.4C10.3 30.9 5 26.2 5 19.1V10l13-6.5Z" stroke="currentColor" stroke-width="1.8"/><path d="m12.5 18.2 3.6 3.6 7.6-8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+        <span class="brand-name">northstar<span class="brand-period">.</span></span>
+      </div>
+      <div class="brand-copy">
+        <p class="eyebrow">YOUR WORK, IN GOOD HANDS</p>
+        <h1>Make room for<br><span>what matters.</span></h1>
+        <p class="brand-description">A clear view of your workday starts here. Pick up right where you left off.</p>
+      </div>
+      <div class="visual-anchor" aria-hidden="true">
+        <div class="orbit orbit-one"></div>
+        <div class="orbit orbit-two"></div>
+        <div class="sun-disc"></div>
+        <div class="visual-caption"><span class="caption-line"></span> A steadier way to work</div>
+      </div>
+      <div class="brand-footer"><span>PRIVATE BY DESIGN</span><span>SECURE ACCESS <b>●</b></span></div>
+    </aside>
+    <section class="content-panel">
+      <div class="mobile-brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 36 36" fill="none"><path d="M18 3.5 31 10v9.1c0 7.1-5.3 11.8-13 14.4C10.3 30.9 5 26.2 5 19.1V10l13-6.5Z" stroke="currentColor" stroke-width="1.8"/><path d="m12.5 18.2 3.6 3.6 7.6-8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="brand-name">northstar<span class="brand-period">.</span></span></div>
+      <div class="form-wrap">{% block content %}{% endblock %}</div>
+      <footer class="content-footer"><span>© 2026 Northstar</span><a href="mailto:support@example.com">Need help?</a></footer>
+    </section>
+  </main>
+  <script src="{{ url_for('static', path='/app.js') }}" defer></script>
+</body>
+</html>

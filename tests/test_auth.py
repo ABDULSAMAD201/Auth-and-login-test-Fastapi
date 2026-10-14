@@ -1,0 +1,121 @@
+import re
+from collections.abc import Iterator
+
+import pytest
+from fastapi.testclient import TestClient
+
+import main
+
+
+@pytest.fixture
+def client(tmp_path, monkeypatch) -> Iterator[TestClient]:
+    monkeypatch.setattr(main, "DATABASE_PATH", tmp_path / "accounts.sqlite3")
+    monkeypatch.setattr(main, "APP_ENV", "development")
+    monkeypatch.delenv("RECAPTCHA_SITE_KEY", raising=False)
+    monkeypatch.delenv("RECAPTCHA_SECRET_KEY", raising=False)
+    with TestClient(main.app) as test_client:
+        with main.connect_db() as connection:
+            connection.execute(
+                "INSERT INTO users (email, password_hash) VALUES (?, ?)",
+                ("member@example.com", main.hash_password("Original-Passphrase-24")),
+            )
+        yield test_client
+
+
+def csrf_token(response_text: str) -> str:
+    match = re.search(r'name="csrf_token" value="([^"]+)"', response_text)
+    assert match
+    return match.group(1)
+
+
+def sign_in(client: TestClient, password: str = "Original-Passphrase-24") -> None:
+    page = client.get("/login")
+    response = client.post(
+        "/login",
+        data={
+            "csrf_token": csrf_token(page.text),
+            "email": "member@example.com",
+            "password": password,
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+
+
+def test_password_hash_verification() -> None:
+    encoded = main.hash_password("a-long-passphrase")
+    assert main.verify_password("a-long-passphrase", encoded)
+    assert not main.verify_password("a-different-passphrase", encoded)
+
+
+def test_login_requires_csrf(client: TestClient) -> None:
+    response = client.post("/login", data={"email": "member@example.com", "password": "wrong"})
+    assert response.status_code == 403
+
+
+def test_user_can_sign_in_and_change_password(client: TestClient) -> None:
+    sign_in(client)
+    assert client.get("/").status_code == 200
+
+    page = client.get("/change-password")
+    response = client.post(
+        "/change-password",
+        data={
+            "csrf_token": csrf_token(page.text),
+            "current_password": "Original-Passphrase-24",
+            "password": "Replacement-Passphrase-35",
+            "confirm_password": "Replacement-Passphrase-35",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/login?")
+    assert client.get("/", follow_redirects=False).status_code == 303
+
+    sign_in(client, "Replacement-Passphrase-35")
+    assert client.get("/").status_code == 200
+
+
+def test_password_reset_token_is_single_use(client: TestClient, caplog) -> None:
+    page = client.get("/forgot-password")
+    response = client.post(
+        "/forgot-password",
+        data={
+            "csrf_token": csrf_token(page.text),
+            "email": "member@example.com",
+        },
+    )
+    assert response.status_code == 200
+    assert "If an account matches that email" in response.text
+    assert "password reset link for member@example.com: " in caplog.text
+    reset_url = re.search(r"password reset link for member@example.com: (http://\S+)", caplog.text)
+    assert reset_url
+
+    reset_page = client.get(reset_url.group(1))
+    response = client.post(
+        "/reset-password",
+        data={
+            "csrf_token": csrf_token(reset_page.text),
+            "token": reset_url.group(1).split("token=", 1)[1],
+            "password": "Reset-Passphrase-2468",
+            "confirm_password": "Reset-Passphrase-2468",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+
+    stale_page = client.get(reset_url.group(1))
+    response = client.post(
+        "/reset-password",
+        data={
+            "csrf_token": csrf_token(stale_page.text),
+            "token": reset_url.group(1).split("token=", 1)[1],
+            "password": "Another-Passphrase-1357",
+            "confirm_password": "Another-Passphrase-1357",
+        },
+    )
+    assert response.status_code == 400
+    assert "invalid or has expired" in response.text
+
+    sign_in(client, "Reset-Passphrase-2468")
+    assert client.get("/").status_code == 200

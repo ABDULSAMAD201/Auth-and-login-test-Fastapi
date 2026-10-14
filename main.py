@@ -1,0 +1,409 @@
+import hashlib
+import hmac
+import logging
+import uvicorn
+import os
+import secrets
+import smtplib
+import sqlite3
+import time
+from contextlib import asynccontextmanager
+from email.message import EmailMessage
+from pathlib import Path
+from urllib.parse import urlencode
+
+import httpx
+from authlib.integrations.starlette_client import OAuth
+from fastapi import BackgroundTasks, FastAPI, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.sessions import SessionMiddleware
+from starlette.templating import Jinja2Templates
+
+
+BASE_DIR = Path(__file__).resolve().parent
+DATABASE_PATH = Path(os.getenv("DATABASE_PATH", BASE_DIR / "accounts.db"))
+APP_ENV = os.getenv("APP_ENV", "development").lower()
+SECRET_KEY = os.getenv("SECRET_KEY") or secrets.token_urlsafe(32)
+SESSION_MAX_AGE = 60 * 60 * 24 * 30
+SESSION_LENGTH = 60 * 60 * 24 * 30
+REGULAR_SESSION_LENGTH = 60 * 60 * 8
+RESET_TOKEN_LENGTH = 60 * 30
+logger = logging.getLogger("signin_auth")
+
+
+def connect_db() -> sqlite3.Connection:
+    connection = sqlite3.connect(DATABASE_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def initialize_database() -> None:
+    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with connect_db() as connection:
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS users (
+                email TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL,
+                reset_token_hash TEXT,
+                reset_expires_at INTEGER
+            )"""
+        )
+        existing = {r["name"] for r in connection.execute("PRAGMA table_info(users)")}
+        for column, ddl in {
+            "failed_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "locked_until": "INTEGER",
+            "session_version": "INTEGER NOT NULL DEFAULT 0",
+        }.items():
+            if column not in existing:
+                connection.execute(f"ALTER TABLE users ADD COLUMN {column} {ddl}")
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1)
+    return f"scrypt${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    try:
+        algorithm, salt_hex, digest_hex = encoded.split("$")
+        if algorithm != "scrypt":
+            return False
+        actual = hashlib.scrypt(
+            password.encode(), salt=bytes.fromhex(salt_hex), n=2**14, r=8, p=1
+        )
+        return hmac.compare_digest(actual, bytes.fromhex(digest_hex))
+    except (ValueError, TypeError):
+        return False
+
+
+def create_csrf_token(request: Request) -> str:
+    token = request.session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        request.session["csrf_token"] = token
+    return token
+
+
+def csrf_is_valid(request: Request, form: object) -> bool:
+    submitted = str(form.get("csrf_token", ""))
+    expected = str(request.session.get("csrf_token", ""))
+    return bool(expected) and hmac.compare_digest(submitted, expected)
+
+
+def render(
+    request: Request,
+    template_name: str,
+    context: dict[str, object] | None = None,
+    status_code: int = 200,
+) -> HTMLResponse:
+    values = context or {}
+    values["csrf_token"] = create_csrf_token(request)
+    values["google_enabled"] = bool(
+        os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET")
+    )
+    values["recaptcha_site_key"] = os.getenv("RECAPTCHA_SITE_KEY", "")
+    values["development_mode"] = APP_ENV != "production"
+    return templates.TemplateResponse(
+        request=request,
+        name=template_name,
+        context=values,
+        status_code=status_code,
+    )
+
+
+def get_user(email: str) -> sqlite3.Row | None:
+    with connect_db() as connection:
+        return connection.execute(
+            "SELECT email, password_hash FROM users WHERE email = ?", (email,)
+        ).fetchone()
+
+
+def signed_in_user(request: Request) -> sqlite3.Row | None:
+    email = request.session.get("email")
+    expires_at = request.session.get("expires_at", 0)
+    if not email or not isinstance(expires_at, int) or expires_at <= int(time.time()):
+        request.session.clear()
+        return None
+    return get_user(email)
+
+
+def redirect_to_login(message: str = "") -> RedirectResponse:
+    suffix = f"?{urlencode({'message': message})}" if message else ""
+    return RedirectResponse(f"/login{suffix}", status_code=303)
+
+
+def recaptcha_configured() -> bool:
+    return bool(os.getenv("RECAPTCHA_SITE_KEY") and os.getenv("RECAPTCHA_SECRET_KEY"))
+
+
+async def recaptcha_is_valid(token: str, remote_ip: str | None) -> bool:
+    if not recaptcha_configured():
+        return APP_ENV != "production"
+    if not token:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            response = await client.post(
+                "https://www.google.com/recaptcha/api/siteverify",
+                data={
+                    "secret": os.environ["RECAPTCHA_SECRET_KEY"],
+                    "response": token,
+                    "remoteip": remote_ip or "",
+                },
+            )
+        return response.is_success and bool(response.json().get("success"))
+    except (httpx.HTTPError, ValueError):
+        logger.exception("reCAPTCHA verification failed")
+        return False
+
+
+def send_reset_email(email: str, reset_url: str) -> None:
+    if not os.getenv("SMTP_HOST"):
+        if APP_ENV != "production":
+            logger.warning("Development password reset link for %s: %s", email, reset_url)
+        else:
+            logger.error("Password reset email is not configured")
+        return
+
+    message = EmailMessage()
+    message["Subject"] = "Reset your Sign-In Portal password"
+    message["From"] = os.getenv("SMTP_FROM", os.getenv("SMTP_USER", ""))
+    message["To"] = email
+    message.set_content(
+        f"Use this link within 30 minutes to reset your password:\n\n{reset_url}\n"
+    )
+    with smtplib.SMTP(os.environ["SMTP_HOST"], int(os.getenv("SMTP_PORT", "587"))) as smtp:
+        smtp.starttls()
+        if os.getenv("SMTP_USER"):
+            smtp.login(os.environ["SMTP_USER"], os.environ["SMTP_PASSWORD"])
+        smtp.send_message(message)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    initialize_database()
+    yield
+
+
+app = FastAPI(title="Sign-In Portal", lifespan=lifespan)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SECRET_KEY,
+    session_cookie="signin_session",
+    max_age=SESSION_MAX_AGE,
+    same_site="lax",
+    https_only=APP_ENV == "production",
+)
+app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+templates = Jinja2Templates(directory=BASE_DIR / "templates")
+
+oauth = OAuth()
+if os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET"):
+    oauth.register(
+        name="google",
+        client_id=os.environ["GOOGLE_CLIENT_ID"],
+        client_secret=os.environ["GOOGLE_CLIENT_SECRET"],
+        server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+        client_kwargs={"scope": "openid email profile"},
+    )
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    return response
+
+
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    user = signed_in_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    return render(request, "account.html", {"email": user["email"]})
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request, message: str = ""):
+    if signed_in_user(request):
+        return RedirectResponse("/", status_code=303)
+    return render(request, "login.html", {"message": message})
+
+
+@app.post("/login", response_class=HTMLResponse)
+async def login(request: Request):
+    form = await request.form()
+    if not csrf_is_valid(request, form):
+        return render(request, "login.html", {"error": "Your session expired. Please try again."}, 403)
+
+    email = str(form.get("email", "")).strip().lower()
+    password = str(form.get("password", ""))
+    captcha = str(form.get("g-recaptcha-response", ""))
+    verified = await recaptcha_is_valid(captcha, request.client.host if request.client else None)
+    user = get_user(email) if verified else None
+    if not user or not verify_password(password, user["password_hash"]):
+        message = "Email or password is incorrect."
+        if not verified:
+            message = "Please complete the human verification and try again."
+        return render(request, "login.html", {"error": message}, 401)
+
+    remember = form.get("remember") == "on"
+    request.session.clear()
+    request.session["email"] = email
+    request.session["expires_at"] = int(time.time()) + (
+        SESSION_LENGTH if remember else REGULAR_SESSION_LENGTH
+    )
+    create_csrf_token(request)
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/logout")
+async def logout(request: Request):
+    form = await request.form()
+    if not csrf_is_valid(request, form):
+        return redirect_to_login("Your session expired. Please try again.")
+    request.session.clear()
+    return RedirectResponse("/login", status_code=303)
+
+
+@app.get("/forgot-password", response_class=HTMLResponse)
+async def forgot_password_page(request: Request):
+    return render(request, "forgot_password.html")
+
+
+@app.post("/forgot-password", response_class=HTMLResponse)
+async def forgot_password(request: Request, background_tasks: BackgroundTasks):
+    form = await request.form()
+    if not csrf_is_valid(request, form):
+        return render(request, "forgot_password.html", {"error": "Your session expired. Please try again."}, 403)
+
+    email = str(form.get("email", "")).strip().lower()
+    user = get_user(email)
+    if user:
+        raw_token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        with connect_db() as connection:
+            connection.execute(
+                "UPDATE users SET reset_token_hash = ?, reset_expires_at = ? WHERE email = ?",
+                (token_hash, int(time.time()) + RESET_TOKEN_LENGTH, email),
+            )
+        public_base_url = os.getenv("PUBLIC_BASE_URL")
+        if public_base_url or APP_ENV != "production":
+            base_url = (public_base_url or str(request.base_url)).rstrip("/")
+            reset_url = f"{base_url}/reset-password?token={raw_token}"
+            background_tasks.add_task(send_reset_email, email, reset_url)
+        else:
+            logger.error("PUBLIC_BASE_URL must be configured to send password reset links")
+
+    return render(
+        request,
+        "forgot_password.html",
+        {"success": "If an account matches that email, password reset instructions are on their way."},
+    )
+
+
+@app.get("/reset-password", response_class=HTMLResponse)
+async def reset_password_page(request: Request, token: str = ""):
+    return render(request, "reset_password.html", {"token": token})
+
+
+@app.post("/reset-password", response_class=HTMLResponse)
+async def reset_password(request: Request):
+    form = await request.form()
+    token = str(form.get("token", ""))
+    if not csrf_is_valid(request, form):
+        return render(request, "reset_password.html", {"token": token, "error": "Your session expired. Please try again."}, 403)
+    new_password = str(form.get("password", ""))
+    confirmation = str(form.get("confirm_password", ""))
+    if len(new_password) < 12:
+        return render(request, "reset_password.html", {"token": token, "error": "Use at least 12 characters for your new password."}, 400)
+    if new_password != confirmation:
+        return render(request, "reset_password.html", {"token": token, "error": "The passwords do not match."}, 400)
+
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    with connect_db() as connection:
+        user = connection.execute(
+            "SELECT email FROM users WHERE reset_token_hash = ? AND reset_expires_at > ?",
+            (token_hash, int(time.time())),
+        ).fetchone()
+        if not user:
+            return render(request, "reset_password.html", {"token": "", "error": "This reset link is invalid or has expired."}, 400)
+        connection.execute(
+            "UPDATE users SET password_hash = ?, reset_token_hash = NULL, reset_expires_at = NULL WHERE email = ?",
+            (hash_password(new_password), user["email"]),
+        )
+    request.session.clear()
+    return redirect_to_login("Password updated. Sign in with your new password.")
+
+
+@app.get("/change-password", response_class=HTMLResponse)
+async def change_password_page(request: Request):
+    user = signed_in_user(request)
+    if not user:
+        return redirect_to_login("Please sign in to change your password.")
+    return render(request, "change_password.html")
+
+
+@app.post("/change-password", response_class=HTMLResponse)
+async def change_password(request: Request):
+    user = signed_in_user(request)
+    if not user:
+        return redirect_to_login("Please sign in to change your password.")
+    form = await request.form()
+    if not csrf_is_valid(request, form):
+        return render(request, "change_password.html", {"error": "Your session expired. Please try again."}, 403)
+
+    current_password = str(form.get("current_password", ""))
+    new_password = str(form.get("password", ""))
+    confirmation = str(form.get("confirm_password", ""))
+    if not verify_password(current_password, user["password_hash"]):
+        return render(request, "change_password.html", {"error": "Your current password is incorrect."}, 400)
+    if len(new_password) < 12:
+        return render(request, "change_password.html", {"error": "Use at least 12 characters for your new password."}, 400)
+    if new_password != confirmation:
+        return render(request, "change_password.html", {"error": "The passwords do not match."}, 400)
+
+    with connect_db() as connection:
+        connection.execute(
+            "UPDATE users SET password_hash = ?, reset_token_hash = NULL, reset_expires_at = NULL WHERE email = ?",
+            (hash_password(new_password), user["email"]),
+        )
+    request.session.clear()
+    return redirect_to_login("Password updated. Sign in again with your new password.")
+
+
+@app.get("/auth/google")
+async def google_login(request: Request):
+    if not (os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET")):
+        return redirect_to_login("Google sign-in is not configured yet.")
+    return await oauth.google.authorize_redirect(request, str(request.url_for("google_callback")))
+
+
+@app.get("/auth/google/callback", name="google_callback")
+async def google_callback(request: Request):
+    try:
+        token = await oauth.google.authorize_access_token(request)
+        profile = token.get("userinfo") or await oauth.google.userinfo(token=token)
+    except Exception:
+        logger.exception("Google OAuth callback failed")
+        return redirect_to_login("Google sign-in could not be completed.")
+
+    email = str(profile.get("email", "")).strip().lower()
+    if not email or not profile.get("email_verified"):
+        return redirect_to_login("Google could not verify your email address.")
+    user = get_user(email)
+    if not user:
+        return redirect_to_login("That Google account is not registered for this portal.")
+
+    request.session.clear()
+    request.session["email"] = email
+    request.session["expires_at"] = int(time.time()) + REGULAR_SESSION_LENGTH
+    create_csrf_token(request)
+    return RedirectResponse("/", status_code=303)
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
