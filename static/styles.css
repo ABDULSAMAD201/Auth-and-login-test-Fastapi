@@ -52,6 +52,7 @@ button, input { font: inherit; }
 .compact-heading { margin-top: 42px; }
 .auth-form { display: flex; flex-direction: column; }
 .field-label { margin: 0 0 8px; color: #394741; font-size: 12px; font-weight: 700; }
+.field-error { margin: 0 0 8px; color: var(--danger); font-size: 12px; }
 .label-row { display: flex; align-items: center; justify-content: space-between; margin-top: 19px; }
 .label-row .field-label { margin: 0 0 8px; }
 .text-link, .back-link { color: #477363; text-decoration: none; font-size: 12px; font-weight: 700; }

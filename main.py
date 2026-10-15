@@ -3,6 +3,7 @@ import hmac
 import logging
 import uvicorn
 import os
+import re
 import secrets
 import smtplib
 import sqlite3
@@ -29,6 +30,8 @@ SESSION_MAX_AGE = 60 * 60 * 24 * 30
 SESSION_LENGTH = 60 * 60 * 24 * 30
 REGULAR_SESSION_LENGTH = 60 * 60 * 8
 RESET_TOKEN_LENGTH = 60 * 30
+SIGN_IN_MAX_FAILED_ATTEMPTS = 5
+SIGN_IN_LOCKOUT_LENGTH = 60 * 30
 logger = logging.getLogger("signin_auth")
 
 
@@ -104,6 +107,7 @@ def render(
     status_code: int = 200,
 ) -> HTMLResponse:
     values = context or {}
+    values.setdefault("field_errors", {})
     values["csrf_token"] = create_csrf_token(request)
     values["google_enabled"] = bool(
         os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET")
@@ -270,23 +274,112 @@ async def login(request: Request):
 
     email = str(form.get("email", "")).strip().lower()
     password = str(form.get("password", ""))
-    captcha = str(form.get("g-recaptcha-response", ""))
-    verified = await recaptcha_is_valid(captcha, request.client.host if request.client else None)
-    user = get_user(email) if verified else None
-    if not user or not verify_password(password, user["password_hash"]):
-        message = "Email or password is incorrect."
-        if not verified:
-            message = "Please complete the human verification and try again."
-        return render(request, "login.html", {"error": message}, 401)
+    field_errors: dict[str, str] = {}
+    if not email:
+        field_errors["email"] = "Email is required."
+    elif not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        field_errors["email"] = "Invalid email format."
+    if not password:
+        field_errors["password"] = "Password is required."
+    if field_errors:
+        return render(
+            request,
+            "login.html",
+            {"field_errors": field_errors, "email_value": email},
+            400,
+        )
 
-    remember = form.get("remember") == "on"
-    request.session.clear()
-    request.session["email"] = email
-    request.session["expires_at"] = int(time.time()) + (
-        SESSION_LENGTH if remember else REGULAR_SESSION_LENGTH
-    )
-    create_csrf_token(request)
-    return RedirectResponse("/", status_code=303)
+    captcha = str(form.get("g-recaptcha-response", ""))
+    if not captcha:
+        return render(
+            request,
+            "login.html",
+            {"error": "Please complete the reCAPTCHA.", "email_value": email},
+            400,
+        )
+
+    try:
+        user = get_user(email)
+        now = int(time.time())
+        if user and user["locked_until"] is not None and user["locked_until"] > now:
+            return render(
+                request,
+                "login.html",
+                {
+                    "error": (
+                        "Your account has been locked due to multiple unsuccessful "
+                        "sign-in attempts. Please reset your password."
+                    ),
+                    "email_value": email,
+                },
+                423,
+            )
+
+        verified = await recaptcha_is_valid(
+            captcha, request.client.host if request.client else None
+        )
+        if not verified:
+            return render(
+                request,
+                "login.html",
+                {
+                    "error": (
+                        "Verification failed. Please complete the CAPTCHA to proceed."
+                    ),
+                    "email_value": email,
+                },
+                401,
+            )
+
+        if not user or not verify_password(password, user["password_hash"]):
+            if user:
+                failed_attempts = int(user["failed_attempts"] or 0)
+                if user["locked_until"] is not None and user["locked_until"] <= now:
+                    failed_attempts = 0
+                failed_attempts += 1
+                locked_until = (
+                    now + SIGN_IN_LOCKOUT_LENGTH
+                    if failed_attempts >= SIGN_IN_MAX_FAILED_ATTEMPTS
+                    else None
+                )
+                with connect_db() as connection:
+                    connection.execute(
+                        "UPDATE users SET failed_attempts = ?, locked_until = ? WHERE email = ?",
+                        (failed_attempts, locked_until, email),
+                    )
+            return render(
+                request,
+                "login.html",
+                {"error": "Incorrect email or password.", "email_value": email},
+                401,
+            )
+
+        with connect_db() as connection:
+            connection.execute(
+                "UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE email = ?",
+                (email,),
+            )
+
+        remember = form.get("remember") == "on"
+        request.session.clear()
+        request.session["email"] = email
+        request.session["sv"] = user["session_version"]
+        request.session["expires_at"] = int(time.time()) + (
+            SESSION_LENGTH if remember else REGULAR_SESSION_LENGTH
+        )
+        create_csrf_token(request)
+        return RedirectResponse("/", status_code=303)
+    except Exception:
+        logger.exception("Unexpected error while signing in")
+        return render(
+            request,
+            "login.html",
+            {
+                "error": "An unexpected error occurred. Please try again later.",
+                "email_value": email,
+            },
+            500,
+        )
 
 
 #checks the csrf token submitted in the form against the expected token stored in the user's session.
@@ -365,7 +458,10 @@ async def reset_password(request: Request):
         if not user:
             return render(request, "reset_password.html", {"token": "", "error": "This reset link is invalid or has expired."}, 400)
         connection.execute(
-            "UPDATE users SET password_hash = ?, reset_token_hash = NULL, reset_expires_at = NULL WHERE email = ?",
+            """UPDATE users
+               SET password_hash = ?, reset_token_hash = NULL, reset_expires_at = NULL,
+                   failed_attempts = 0, locked_until = NULL
+               WHERE email = ?""",
             (hash_password(new_password), user["email"]),
         )
     request.session.clear()
@@ -433,6 +529,7 @@ async def google_callback(request: Request):
 
     request.session.clear()
     request.session["email"] = email
+    request.session["sv"] = user["session_version"]
     request.session["expires_at"] = int(time.time()) + REGULAR_SESSION_LENGTH
     create_csrf_token(request)
     return RedirectResponse("/", status_code=303)
