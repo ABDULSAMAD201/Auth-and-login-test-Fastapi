@@ -6,14 +6,14 @@ import os
 import re
 import secrets
 import smtplib
-import sqlite3
 import time
-from contextlib import asynccontextmanager
 from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import urlencode
 
 import httpx
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from authlib.integrations.starlette_client import OAuth
 from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -21,9 +21,10 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.templating import Jinja2Templates
 
+import database
+from models import User
 
 BASE_DIR = Path(__file__).resolve().parent
-DATABASE_PATH = Path(os.getenv("DATABASE_PATH", BASE_DIR / "accounts.db"))
 APP_ENV = os.getenv("APP_ENV", "development").lower()
 SECRET_KEY = os.getenv("SECRET_KEY") or secrets.token_urlsafe(32)
 SESSION_MAX_AGE = 60 * 60 * 24 * 30
@@ -45,37 +46,6 @@ US_STATES = (
     "West Virginia", "Wisconsin", "Wyoming", "District of Columbia",
 )
 logger = logging.getLogger("signin_auth")
-
-
-def connect_db() -> sqlite3.Connection:
-    connection = sqlite3.connect(DATABASE_PATH)
-    connection.row_factory = sqlite3.Row
-    return connection
-
-
-def initialize_database() -> None:
-    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with connect_db() as connection:
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS users (
-                email TEXT PRIMARY KEY,
-                password_hash TEXT NOT NULL,
-                reset_token_hash TEXT,
-                reset_expires_at INTEGER
-            )"""
-        )
-        existing = {r["name"] for r in connection.execute("PRAGMA table_info(users)")}
-        for column, ddl in {
-            "full_name": "TEXT",
-            "phone": "TEXT",
-            "state": "TEXT",
-            "terms_accepted_at": "INTEGER",
-            "failed_attempts": "INTEGER NOT NULL DEFAULT 0",
-            "locked_until": "INTEGER",
-            "session_version": "INTEGER NOT NULL DEFAULT 0",
-        }.items():
-            if column not in existing:
-                connection.execute(f"ALTER TABLE users ADD COLUMN {column} {ddl}")
 
 
 # i made this function to hash passwords using scrypt, which is a secure password hashing algorithm. It generates a random salt and uses it to hash the password, 
@@ -139,12 +109,10 @@ def render(
 
 #this function retrieves a user from the database based on their email address.
 #It connects to the database, executes a query to select the user with the specified email, 
-#and returns the result as a sqlite3.Row object. If no user is found, it returns None.
-def get_user(email: str) -> sqlite3.Row | None:
-    with connect_db() as connection:
-        return connection.execute(
-            "SELECT * FROM users WHERE email = ?", (email,)
-        ).fetchone()
+#and returns the user object. If no user is found, it returns None.
+def get_user(email: str) -> User | None:
+    with database.SessionLocal() as db:
+        return db.get(User, email)
 
 
 #It checks the session for the user's email and expiration time, 
@@ -157,18 +125,16 @@ def signed_in_user(request: Request):
         request.session.clear()
         return None
     user = get_user(email)
-    if not user or request.session.get("sv") != user["session_version"]:
+    if not user or request.session.get("sv") != user.session_version:
         request.session.clear()
         return None
     return user
 
 
-def start_session(
-    request: Request, user: sqlite3.Row, remember: bool = False
-) -> None:
+def start_session(request: Request, user: User, remember: bool = False) -> None:
     request.session.clear()
-    request.session["email"] = user["email"]
-    request.session["sv"] = user["session_version"]
+    request.session["email"] = user.email
+    request.session["sv"] = user.session_version
     request.session["expires_at"] = int(time.time()) + (
         SESSION_LENGTH if remember else REGULAR_SESSION_LENGTH
     )
@@ -236,16 +202,13 @@ def send_reset_email(email: str, reset_url: str) -> None:
         smtp.send_message(message)
 
 
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    initialize_database()
-    yield
+
 
 
 #session middleware makes request.session work with cookie signed secret key.
 #It also sets the session cookie name, max age, same site policy, 
 #and whether it should be sent over HTTPS only in production.
-app = FastAPI(title="Sign-In Portal", lifespan=lifespan)
+app = FastAPI(title="Sign-In Portal")
 app.add_middleware(
     SessionMiddleware,
     secret_key=SECRET_KEY,
@@ -289,9 +252,11 @@ async def home(request: Request):
         request,
         "account.html",
         {
-            "email": user["email"],
+            "email": user.email,
             "welcome_message": (
-                f"Welcome, {user['full_name']}!" if request.query_params.get("welcome") else ""
+                f"Welcome, {user.full_name}!"
+                if request.query_params.get("welcome")
+                else ""
             ),
         },
     )
@@ -379,24 +344,18 @@ async def register(request: Request):
         return render(request, "register.html", context, 400)
 
     try:
-        with connect_db() as connection:
-            connection.execute(
-                """INSERT INTO users
-                   (email, password_hash, full_name, phone, state, terms_accepted_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    email,
-                    hash_password(password),
-                    full_name,
-                    phone,
-                    state,
-                    int(time.time()),
-                ),
+        with database.SessionLocal() as db:
+            user = User(
+                email=email,
+                password_hash=hash_password(password),
+                full_name=full_name,
+                phone=phone,
+                state=state,
+                terms_accepted_at=int(time.time()),
             )
-            user = connection.execute(
-                "SELECT * FROM users WHERE email = ?", (email,)
-            ).fetchone()
-    except sqlite3.IntegrityError:
+            db.add(user)
+            db.commit()
+    except IntegrityError:
         return render(
             request,
             "register.html",
@@ -418,17 +377,6 @@ async def register(request: Request):
             500,
         )
 
-    if not user:
-        logger.error("Newly created account could not be loaded: %s", email)
-        return render(
-            request,
-            "register.html",
-            {
-                **context,
-                "error": "An unexpected error occurred. Please try again later.",
-            },
-            500,
-        )
     start_session(request, user)
     return RedirectResponse("/?welcome=1", status_code=303)
 
@@ -475,7 +423,7 @@ async def login(request: Request):
     try:
         user = get_user(email)
         now = int(time.time())
-        if user and user["locked_until"] is not None and user["locked_until"] > now:
+        if user and user.locked_until is not None and user.locked_until > now:
             return render(
                 request,
                 "login.html",
@@ -505,10 +453,10 @@ async def login(request: Request):
                 401,
             )
 
-        if not user or not verify_password(password, user["password_hash"]):
+        if not user or not verify_password(password, user.password_hash):
             if user:
-                failed_attempts = int(user["failed_attempts"] or 0)
-                if user["locked_until"] is not None and user["locked_until"] <= now:
+                failed_attempts = int(user.failed_attempts or 0)
+                if user.locked_until is not None and user.locked_until <= now:
                     failed_attempts = 0
                 failed_attempts += 1
                 locked_until = (
@@ -516,10 +464,14 @@ async def login(request: Request):
                     if failed_attempts >= SIGN_IN_MAX_FAILED_ATTEMPTS
                     else None
                 )
-                with connect_db() as connection:
-                    connection.execute(
-                        "UPDATE users SET failed_attempts = ?, locked_until = ? WHERE email = ?",
-                        (failed_attempts, locked_until, email),
+                with database.SessionLocal.begin() as db:
+                    db.execute(
+                        update(User)
+                        .where(User.email == email)
+                        .values(
+                            failed_attempts=failed_attempts,
+                            locked_until=locked_until,
+                        )
                     )
             return render(
                 request,
@@ -528,10 +480,11 @@ async def login(request: Request):
                 401,
             )
 
-        with connect_db() as connection:
-            connection.execute(
-                "UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE email = ?",
-                (email,),
+        with database.SessionLocal.begin() as db:
+            db.execute(
+                update(User)
+                .where(User.email == email)
+                .values(failed_attempts=0, locked_until=None)
             )
 
         start_session(request, user, remember=form.get("remember") == "on")
@@ -578,10 +531,14 @@ async def forgot_password(request: Request, background_tasks: BackgroundTasks):
     if user:
         raw_token = secrets.token_urlsafe(32)
         token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
-        with connect_db() as connection:
-            connection.execute(
-                "UPDATE users SET reset_token_hash = ?, reset_expires_at = ? WHERE email = ?",
-                (token_hash, int(time.time()) + RESET_TOKEN_LENGTH, email),
+        with database.SessionLocal.begin() as db:
+            db.execute(
+                update(User)
+                .where(User.email == email)
+                .values(
+                    reset_token_hash=token_hash,
+                    reset_expires_at=int(time.time()) + RESET_TOKEN_LENGTH,
+                )
             )
         public_base_url = os.getenv("PUBLIC_BASE_URL")
         if public_base_url or APP_ENV != "production":
@@ -617,19 +574,25 @@ async def reset_password(request: Request):
         return render(request, "reset_password.html", {"token": token, "error": "The passwords do not match."}, 400)
 
     token_hash = hashlib.sha256(token.encode()).hexdigest()
-    with connect_db() as connection:
-        user = connection.execute(
-            "SELECT email FROM users WHERE reset_token_hash = ? AND reset_expires_at > ?",
-            (token_hash, int(time.time())),
-        ).fetchone()
+    with database.SessionLocal.begin() as db:
+        user = db.scalar(
+            select(User).where(
+                User.reset_token_hash == token_hash,
+                User.reset_expires_at > int(time.time()),
+            )
+        )
         if not user:
             return render(request, "reset_password.html", {"token": "", "error": "This reset link is invalid or has expired."}, 400)
-        connection.execute(
-            """UPDATE users
-               SET password_hash = ?, reset_token_hash = NULL, reset_expires_at = NULL,
-                   failed_attempts = 0, locked_until = NULL
-               WHERE email = ?""",
-            (hash_password(new_password), user["email"]),
+        db.execute(
+            update(User)
+            .where(User.email == user.email)
+            .values(
+                password_hash=hash_password(new_password),
+                reset_token_hash=None,
+                reset_expires_at=None,
+                failed_attempts=0,
+                locked_until=None,
+            )
         )
     request.session.clear()
     return redirect_to_login("Password updated. Sign in with your new password.")
@@ -655,17 +618,22 @@ async def change_password(request: Request):
     current_password = str(form.get("current_password", ""))
     new_password = str(form.get("password", ""))
     confirmation = str(form.get("confirm_password", ""))
-    if not verify_password(current_password, user["password_hash"]):
+    if not verify_password(current_password, user.password_hash):
         return render(request, "change_password.html", {"error": "Your current password is incorrect."}, 400)
     if len(new_password) < 12:
         return render(request, "change_password.html", {"error": "Use at least 12 characters for your new password."}, 400)
     if new_password != confirmation:
         return render(request, "change_password.html", {"error": "The passwords do not match."}, 400)
 
-    with connect_db() as connection:
-        connection.execute(
-            "UPDATE users SET password_hash = ?, reset_token_hash = NULL, reset_expires_at = NULL WHERE email = ?",
-            (hash_password(new_password), user["email"]),
+    with database.SessionLocal.begin() as db:
+        db.execute(
+            update(User)
+            .where(User.email == user.email)
+            .values(
+                password_hash=hash_password(new_password),
+                reset_token_hash=None,
+                reset_expires_at=None,
+            )
         )
     request.session.clear()
     return redirect_to_login("Password updated. Sign in again with your new password.")

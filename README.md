@@ -1,6 +1,6 @@
 # Northstar Sign-In Portal
 
-A FastAPI starter for registered-user sign-in, password recovery, and password changes. Accounts are stored in SQLite, passwords are hashed with scrypt, browser sessions are signed and time-limited, and form submissions use CSRF tokens.
+A FastAPI starter for account registration, sign-in, password recovery, and password changes. Accounts are stored in PostgreSQL through SQLAlchemy 2.0, passwords are hashed with scrypt, browser sessions are signed and time-limited, and form submissions use CSRF tokens.
 
 ## Run locally
 
@@ -8,6 +8,8 @@ A FastAPI starter for registered-user sign-in, password recovery, and password c
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+$env:DATABASE_URL = "postgresql+psycopg://postgres@localhost/signin_auth"
+alembic upgrade head
 python create_user.py you@example.com
 uvicorn main:app --reload
 ```
@@ -23,7 +25,7 @@ Set these environment variables before starting the server:
 | Variable | Purpose |
 | --- | --- |
 | `SECRET_KEY` | Long, random signing key for session cookies |
-| `DATABASE_PATH` | Optional SQLite database path; defaults to `accounts.db` |
+| `DATABASE_URL` | SQLAlchemy PostgreSQL URL; defaults to `postgresql+psycopg://postgres@localhost/signin_auth` |
 | `APP_ENV` | Set to `production` to require HTTPS cookies and reCAPTCHA verification |
 | `PUBLIC_BASE_URL` | Canonical public origin used in password reset links, e.g. `https://portal.example.com` |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google OAuth web client credentials; register `/auth/google/callback` as the redirect URI |
@@ -39,3 +41,5 @@ For production, configure HTTPS at the reverse proxy, set a stable `SECRET_KEY` 
 ```powershell
 pytest
 ```
+
+Tests use an isolated SQLite database through the SQLAlchemy ORM; the application uses PostgreSQL.

@@ -3,23 +3,33 @@ from collections.abc import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
+import database
 import main
+from models import Base, User
 
 
 @pytest.fixture
 def client(tmp_path, monkeypatch) -> Iterator[TestClient]:
-    monkeypatch.setattr(main, "DATABASE_PATH", tmp_path / "accounts.sqlite3")
+    engine = create_engine(f"sqlite:///{tmp_path / 'accounts.sqlite3'}")
+    Base.metadata.create_all(engine)
+    test_session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    monkeypatch.setattr(database, "SessionLocal", test_session)
     monkeypatch.setattr(main, "APP_ENV", "development")
     monkeypatch.delenv("RECAPTCHA_SITE_KEY", raising=False)
     monkeypatch.delenv("RECAPTCHA_SECRET_KEY", raising=False)
     with TestClient(main.app) as test_client:
-        with main.connect_db() as connection:
-            connection.execute(
-                "INSERT INTO users (email, password_hash) VALUES (?, ?)",
-                ("member@example.com", main.hash_password("Original-Passphrase-24")),
+        with test_session.begin() as db:
+            db.add(
+                User(
+                    email="member@example.com",
+                    password_hash=main.hash_password("Original-Passphrase-24"),
+                )
             )
         yield test_client
+    engine.dispose()
 
 
 def csrf_token(response_text: str) -> str:
@@ -91,11 +101,11 @@ def test_registration_creates_user_and_starts_session(client: TestClient) -> Non
 
     user = main.get_user("taylor@example.com")
     assert user is not None
-    assert user["full_name"] == "Taylor Driver"
-    assert user["phone"] == "555-0100"
-    assert user["state"] == "California"
-    assert user["terms_accepted_at"] is not None
-    assert main.verify_password("secure1", user["password_hash"])
+    assert user.full_name == "Taylor Driver"
+    assert user.phone == "555-0100"
+    assert user.state == "California"
+    assert user.terms_accepted_at is not None
+    assert main.verify_password("secure1", user.password_hash)
     assert client.get("/").status_code == 200
     welcome = client.get("/?welcome=1")
     assert "Welcome, Taylor Driver!" in welcome.text
@@ -277,13 +287,11 @@ def test_five_failed_passwords_lock_account_for_30_minutes(client: TestClient) -
         assert response.status_code == 401
         assert "Incorrect email or password." in response.text
 
-    with main.connect_db() as connection:
-        user = connection.execute(
-            "SELECT failed_attempts, locked_until FROM users WHERE email = ?",
-            ("member@example.com",),
-        ).fetchone()
-    assert user["failed_attempts"] == 5
-    assert user["locked_until"] - int(main.time.time()) in range(1798, 1801)
+    with database.SessionLocal() as db:
+        user = db.get(User, "member@example.com")
+        assert user is not None
+    assert user.failed_attempts == 5
+    assert user.locked_until - int(main.time.time()) in range(1798, 1801)
 
     page = client.get("/login")
     response = client.post(
@@ -303,19 +311,16 @@ def test_five_failed_passwords_lock_account_for_30_minutes(client: TestClient) -
 
 
 def test_successful_login_resets_failed_attempts(client: TestClient) -> None:
-    with main.connect_db() as connection:
-        connection.execute(
-            "UPDATE users SET failed_attempts = 4 WHERE email = ?",
-            ("member@example.com",),
-        )
+    with database.SessionLocal.begin() as db:
+        user = db.get(User, "member@example.com")
+        assert user is not None
+        user.failed_attempts = 4
     sign_in(client)
-    with main.connect_db() as connection:
-        user = connection.execute(
-            "SELECT failed_attempts, locked_until FROM users WHERE email = ?",
-            ("member@example.com",),
-        ).fetchone()
-    assert user["failed_attempts"] == 0
-    assert user["locked_until"] is None
+    with database.SessionLocal() as db:
+        user = db.get(User, "member@example.com")
+        assert user is not None
+    assert user.failed_attempts == 0
+    assert user.locked_until is None
 
 
 def test_unexpected_login_error_shows_generic_message(
@@ -359,17 +364,17 @@ def test_user_can_sign_in_and_change_password(client: TestClient) -> None:
     assert client.get("/", follow_redirects=False).status_code == 303
 
     user = main.get_user("member@example.com")
-    assert user and main.verify_password("Replacement-Passphrase-35", user["password_hash"])
+    assert user and main.verify_password("Replacement-Passphrase-35", user.password_hash)
     sign_in(client, "Replacement-Passphrase-35")
     assert client.get("/").status_code == 200
 
 
 def test_password_reset_token_is_single_use(client: TestClient, caplog) -> None:
-    with main.connect_db() as connection:
-        connection.execute(
-            "UPDATE users SET failed_attempts = 5, locked_until = 9999999999 WHERE email = ?",
-            ("member@example.com",),
-        )
+    with database.SessionLocal.begin() as db:
+        user = db.get(User, "member@example.com")
+        assert user is not None
+        user.failed_attempts = 5
+        user.locked_until = 9999999999
 
     page = client.get("/forgot-password")
     response = client.post(
@@ -397,13 +402,11 @@ def test_password_reset_token_is_single_use(client: TestClient, caplog) -> None:
         follow_redirects=False,
     )
     assert response.status_code == 303
-    with main.connect_db() as connection:
-        user = connection.execute(
-            "SELECT failed_attempts, locked_until FROM users WHERE email = ?",
-            ("member@example.com",),
-        ).fetchone()
-    assert user["failed_attempts"] == 0
-    assert user["locked_until"] is None
+    with database.SessionLocal() as db:
+        user = db.get(User, "member@example.com")
+        assert user is not None
+    assert user.failed_attempts == 0
+    assert user.locked_until is None
 
     stale_page = client.get(reset_url.group(1))
     response = client.post(

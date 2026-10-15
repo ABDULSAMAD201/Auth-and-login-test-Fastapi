@@ -1,6 +1,10 @@
 import getpass
 import sys
-from main import connect_db, hash_password, initialize_database
+from sqlalchemy.exc import IntegrityError
+
+from database import SessionLocal
+from main import hash_password
+from models import User
 
 
 def main() -> None:
@@ -18,17 +22,16 @@ def main() -> None:
     if password != confirmation:
         raise SystemExit("Passwords do not match.")
 
-    initialize_database()
     try:
-        with connect_db() as connection:
-            connection.execute(
-                "INSERT INTO users (email, password_hash) VALUES (?, ?)",
-                (email, hash_password(password)),
+        with SessionLocal.begin() as db:
+            db.add(
+                User(
+                    email=email,
+                    password_hash=hash_password(password),
+                )
             )
-    except Exception as error:
-        if "UNIQUE constraint failed" in str(error):
-            raise SystemExit("An account with that email already exists.") from error
-        raise
+    except IntegrityError as error:
+        raise SystemExit("An account with that email already exists.") from error
     print(f"Registered {email}")
 
 
