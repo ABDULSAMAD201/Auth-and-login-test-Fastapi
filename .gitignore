@@ -5,3 +5,5 @@ __pycache__/
 accounts.db
 *.sqlite3
 .env
+.freebuff
+.github
