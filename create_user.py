@@ -8,10 +8,13 @@ from models import User
 
 
 def main() -> None:
-    if len(sys.argv) != 2:
-        raise SystemExit("Usage: python create_user.py email@example.com")
+    args = sys.argv[1:]
+    if not args:
+        raise SystemExit("Usage: python create_user.py email@example.com [--admin]")
 
-    email = sys.argv[1].strip().lower()
+    email = args[0].strip().lower()
+    is_admin = "--admin" in args[1:]
+
     if "@" not in email or len(email) > 254:
         raise SystemExit("Enter a valid email address.")
 
@@ -28,11 +31,14 @@ def main() -> None:
                 User(
                     email=email,
                     password_hash=hash_password(password),
+                    role="admin" if is_admin else "customer",
                 )
             )
     except IntegrityError as error:
         raise SystemExit("An account with that email already exists.") from error
-    print(f"Registered {email}")
+
+    kind = "admin" if is_admin else "customer"
+    print(f"Registered {email} as {kind}")
 
 
 if __name__ == "__main__": 

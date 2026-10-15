@@ -11,10 +11,11 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 import httpx
-from sqlalchemy import select
+from datetime import datetime, timezone
+from sqlalchemy import Integer, select, text, func
 from sqlalchemy.exc import IntegrityError
 from authlib.integrations.starlette_client import OAuth
-from fastapi import BackgroundTasks, Depends, FastAPI, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import ValidationError
@@ -24,7 +25,27 @@ from starlette.middleware.sessions import SessionMiddleware
 from starlette.templating import Jinja2Templates
 
 import database
-from models import User
+from models import (
+    Booking,
+    BookingStatus,
+    ParkingLot,
+    ParkingSpace,
+    User,
+    get_space_status,
+    is_space_available,
+    is_space_available_for_capacity,
+)
+
+from schemas import (
+    APIResponse,
+    BookingResponse,
+    ChangePassword,
+    ForgotPassword,
+    Login,
+    Register,
+    ResetPassword,
+    UserResponse,
+)
 from schemas import (
     APIResponse,
     ChangePassword,
@@ -35,8 +56,72 @@ from schemas import (
     UserResponse,
 )
 
+ALLOWED_ROLES = ("customer", "admin")
+PARKING_LOT_VALIDATOR = staticmethod(lambda value: int(value))
+
+
+def require_admin(user: User) -> User:
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    return user
+
+
+def require_customer(user: User) -> User:
+    if user.role != "customer":
+        raise HTTPException(status_code=403, detail="Customer access required.")
+    return user
+
+
+def is_current_user_admin(request: Request) -> bool:
+    signed = signed_in_user(request)
+    if not signed:
+        return False
+    return signed.role == "admin"
+
+
+def is_valid_parking_lot_capacity(value: str) -> int:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Capacity is required.")
+    try:
+        capacity = int(value)
+    except ValueError:
+        raise ValueError("Capacity must be a whole number.")
+    if capacity < 1:
+        raise ValueError("Capacity must be a positive number.")
+    return capacity
+
+
+def parse_datetime(value: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError("Invalid booking time format.")
+    value = value.strip()
+    if not value:
+        raise ValueError("Invalid booking time format.")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError("Invalid booking time format.")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    else:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed
+
+
+def booking_open_status(status: str) -> bool:
+    return status in ("Pending", "Active")
+
+
+def create_parking_lot_from_form(values: dict[str, str]) -> ParkingLot:
+    return ParkingLot(
+        name=values["name"].strip(),
+        location=values["location"].strip(),
+        capacity=int(values["capacity"]),
+    )
+
 BASE_DIR = Path(__file__).resolve().parent
 APP_ENV = os.getenv("APP_ENV", "development").lower()
+BOOKING_ROOM_THRESHOLD_MINUTES = int(os.getenv("BOOKING_ROOM_THRESHOLD_MINUTES", "5"))
 SECRET_KEY = os.getenv("SECRET_KEY") or secrets.token_urlsafe(32)
 SESSION_MAX_AGE = 60 * 60 * 24 * 30
 SESSION_LENGTH = 60 * 60 * 24 * 30
@@ -297,7 +382,14 @@ async def recaptcha_is_valid(token: str, remote_ip: str | None) -> bool:
     except (httpx.HTTPError, ValueError):
         logger.exception("reCAPTCHA verification failed")
         return False
-    
+
+
+async def verify_captcha(token: str, remote_ip: str | None) -> bool:
+    result = recaptcha_is_valid(token, remote_ip)
+    if hasattr(result, "__await__"):
+        return bool(await result)
+    return bool(result)
+
 
 #emails the link or logs it in development mode. It checks if the SMTP_HOST environment variable is set,
 #and if not, it logs a warning or error message depending on the environment. If the SMTP_HOST is set, 
@@ -391,6 +483,19 @@ async def home(request: Request):
     user = signed_in_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
+    if user.role == "admin":
+        return render(
+            request,
+            "account.html",
+            {
+                "email": user.email,
+                "welcome_message": (
+                    f"Welcome, {user.full_name}!"
+                    if request.query_params.get("welcome")
+                    else ""
+                ),
+            },
+        )
     return render(
         request,
         "account.html",
@@ -401,6 +506,436 @@ async def home(request: Request):
                 if request.query_params.get("welcome")
                 else ""
             ),
+        },
+    )
+
+
+@app.get(
+    "/admin",
+    response_class=HTMLResponse,
+    summary="Admin-only dashboard",
+)
+async def admin_page(request: Request):
+    user = signed_in_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    require_admin(user)
+    lots = []
+    with database.SessionLocal() as db:
+        lots = db.scalars(
+            select(ParkingLot).order_by(ParkingLot.id)
+        ).all()
+    return render(
+        request,
+        "admin.html",
+        {
+            "email": user.email,
+            "full_name": user.full_name or "",
+            "parking_lots": lots,
+        },
+    )
+
+
+@app.get(
+    "/admin/parking-lots",
+    response_class=HTMLResponse,
+    summary="Parking lot management",
+)
+async def parking_lot_page(request: Request):
+    user = signed_in_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    require_admin(user)
+    lots = []
+    with database.SessionLocal() as db:
+        lots = db.scalars(
+            select(ParkingLot).order_by(ParkingLot.id)
+        ).all()
+    return render(
+        request,
+        "parking_lots.html",
+        {
+            "parking_lots": lots,
+        },
+    )
+
+
+@app.get(
+    "/admin/parking-lots/{lot_id:int}",
+    response_class=HTMLResponse,
+    summary="View a parking lot and its spaces",
+)
+async def parking_lot_detail_page(request: Request, lot_id: int) -> HTMLResponse:
+    user = signed_in_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    require_admin(user)
+
+    with database.SessionLocal() as db:
+        lot = db.get(ParkingLot, lot_id)
+        if not lot:
+            return RedirectResponse(
+                "/admin/parking-lots",
+                status_code=303,
+            )
+        spaces = db.scalars(
+            select(ParkingSpace)
+            .where(ParkingSpace.lot_id == lot.id)
+            .order_by(ParkingSpace.id)
+        ).all()
+
+    return render(
+        request,
+        "parking_lot_detail.html",
+        {
+            "lot": lot,
+            "spaces": spaces,
+            "get_space_status": get_space_status,
+        },
+    )
+
+
+@app.post(
+    "/admin/parking-lots/{lot_id:int}/spaces",
+    response_class=HTMLResponse,
+    summary="Add a parking space to a lot",
+)
+async def create_parking_space(request: Request, lot_id: int) -> HTMLResponse:
+    _admin_required_redirect(request)
+
+    _admin_required_redirect(request)
+
+    form = await request.form()
+    raw_notes = str(form.get("notes", ""))
+    values: dict[str, str] = {
+        "name": str(form.get("name", "")).strip(),
+        "notes": raw_notes.strip(),
+    }
+
+    errors: dict[str, str] = {}
+    if not values["name"]:
+        errors["name"] = "Space name is required."
+
+    if errors:
+        with database.SessionLocal() as db:
+            lot = db.get(ParkingLot, lot_id)
+            if not lot:
+                return RedirectResponse(
+                    "/admin/parking-lots",
+                    status_code=303,
+                )
+            spaces = db.scalars(
+                select(ParkingSpace)
+                .where(ParkingSpace.lot_id == lot.id)
+                .order_by(ParkingSpace.id)
+            ).all()
+        return render(
+            request,
+            "parking_lot_detail.html",
+            {
+                "lot": lot,
+                "spaces": spaces,
+                "form_values": values,
+                "form_errors": errors,
+            },
+            400,
+        )
+
+    try:
+        with database.SessionLocal.begin() as db:
+            lot = db.get(ParkingLot, lot_id)
+            if not lot:
+                return RedirectResponse(
+                    "/admin/parking-lots",
+                    status_code=303,
+                )
+
+            if not is_space_available_for_capacity(lot):
+                raise ValueError(
+                    f"Total spaces exceed the defined parking lot capacity of {lot.capacity}"
+                )
+
+            space = ParkingSpace(
+                lot_id=lot.id,
+                name=values["name"],
+                notes=values["notes"] or None,
+            )
+            db.add(space)
+
+        return RedirectResponse(
+            f"/admin/parking-lots/{lot.id}?added={values['name']}",
+            status_code=303,
+        )
+
+    except ValueError as error:
+        with database.SessionLocal() as db:
+            lot = db.get(ParkingLot, lot_id)
+            if not lot:
+                return RedirectResponse(
+                    "/admin/parking-lots",
+                    status_code=303,
+                )
+            spaces = db.scalars(
+                select(ParkingSpace)
+                .where(ParkingSpace.lot_id == lot.id)
+                .order_by(ParkingSpace.id)
+            ).all()
+        return render(
+            request,
+            "parking_lot_detail.html",
+            {
+                "lot": lot,
+                "spaces": spaces,
+                "form_values": values,
+                "form_errors": {"form": str(error)},
+            },
+            400,
+        )
+    except IntegrityError:
+        with database.SessionLocal() as db:
+            lot = db.get(ParkingLot, lot_id)
+            if not lot:
+                return RedirectResponse(
+                    "/admin/parking-lots",
+                    status_code=303,
+                )
+            spaces = db.scalars(
+                select(ParkingSpace)
+                .where(ParkingSpace.lot_id == lot.id)
+                .order_by(ParkingSpace.id)
+            ).all()
+        return render(
+            request,
+            "parking_lot_detail.html",
+            {
+                "lot": lot,
+                "spaces": spaces,
+                "form_values": values,
+                "form_errors": {
+                    "name": "A space with that name already exists in this lot.",
+                },
+            },
+            400,
+        )
+    except Exception:
+        logger.exception("Unexpected error while adding parking space")
+        with database.SessionLocal() as db:
+            lot = db.get(ParkingLot, lot_id)
+            if not lot:
+                return RedirectResponse(
+                    "/admin/parking-lots",
+                    status_code=303,
+                )
+            spaces = db.scalars(
+                select(ParkingSpace)
+                .where(ParkingSpace.lot_id == lot.id)
+                .order_by(ParkingSpace.id)
+            ).all()
+        return render(
+            request,
+            "parking_lot_detail.html",
+            {
+                "lot": lot,
+                "spaces": spaces,
+                "form_values": values,
+                "form_errors": {
+                    "form": "An unexpected error occurred. Please try again.",
+                },
+            },
+            500,
+        )
+
+
+@app.get(
+    "/dashboard",
+    response_class=HTMLResponse,
+    summary="Customer dashboard",
+)
+async def dashboard_page(request: Request):
+    user = signed_in_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    require_customer(user)
+    lots = []
+    with database.SessionLocal() as db:
+        lots = db.scalars(
+            select(ParkingLot).order_by(ParkingLot.id)
+        ).all()
+
+    lot_summaries: list[dict[str, object]] = []
+    with database.SessionLocal() as db:
+        for lot in lots:
+            total_spaces = db.scalar(
+                select(db.func.count()).select_from(ParkingSpace).where(
+                    ParkingSpace.lot_id == lot.id
+                )
+            )
+            total_spaces = int(total_spaces) if total_spaces is not None else 0
+            available = db.scalar(
+                select(db.func.count()).select_from(ParkingSpace).where(
+                    ParkingSpace.lot_id == lot.id,
+                    ~ParkingSpace.bookings.any(
+                        Booking.status.in_(["Pending", "Active"])
+                    ),
+                )
+            )
+            available = int(available) if available is not None else 0
+            if available < 0:
+                available = 0
+            lot_summaries.append(
+                {
+                    "id": lot.id,
+                    "name": lot.name,
+                    "location": lot.location,
+                    "total_spaces": total_spaces,
+                    "available_spaces": available,
+                }
+            )
+
+    return render(
+        request,
+        "dashboard.html",
+        {
+            "email": user.email,
+            "welcome_message": (
+                f"Welcome, {user.full_name}!"
+                if request.query_params.get("welcome")
+                else ""
+            ),
+            "lots": lot_summaries,
+        },
+    )
+
+
+def _user_id_for_session(request: Request) -> int:
+    user = signed_in_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not signed in.")
+    return user.id
+
+
+def _require_current_user_booking(request: Request, booking: Booking) -> Booking:
+    user_id = _user_id_for_session(request)
+    if booking.user_id != user_id:
+        raise HTTPException(status_code=403, detail="You do not own this booking.")
+    return booking
+
+
+
+@app.get(
+    "/dashboard/lots/{lot_id:int}/spaces/{space_id:int}/new",
+    response_class=HTMLResponse,
+    summary="Prepare a booking request for an available space",
+)
+async def customer_space_new_page(request: Request, lot_id: int, space_id: int) -> HTMLResponse:
+    user = signed_in_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    require_customer(user)
+
+    with database.SessionLocal() as db:
+        lot = db.get(ParkingLot, lot_id)
+        if not lot:
+            return RedirectResponse(
+                "/dashboard",
+                status_code=303,
+            )
+        space = db.get(ParkingSpace, space_id)
+        if not space or space.lot_id != lot.id:
+            return RedirectResponse(
+                "/dashboard",
+                status_code=303,
+            )
+        open_status, color = get_space_status(space)
+        if open_status is not None:
+            return RedirectResponse(
+                f"/dashboard/lots/{lot_id}/spaces/{space_id}",
+                status_code=303,
+            )
+
+    return render(
+        request,
+        "customer_space_new.html",
+        {
+            "lot": lot,
+            "space": space,
+            "csrf_token": create_csrf_token(request),
+        },
+    )
+
+
+@app.get(
+    "/dashboard/lots/{lot_id:int}/spaces/{space_id:int}",
+    response_class=HTMLResponse,
+    summary="Customer space detail and ticket actions",
+)
+async def customer_space_page(request: Request, lot_id: int, space_id: int) -> HTMLResponse:
+    user = signed_in_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    require_customer(user)
+
+    with database.SessionLocal() as db:
+        lot = db.get(ParkingLot, lot_id)
+        if not lot:
+            return RedirectResponse(
+                "/dashboard",
+                status_code=303,
+            )
+        space = db.get(ParkingSpace, space_id)
+        if not space or space.lot_id != lot.id:
+            return RedirectResponse(
+                "/dashboard",
+                status_code=303,
+            )
+        bookings = db.scalars(
+            select(Booking)
+            .where(Booking.space_id == space.id)
+            .order_by(Booking.id)
+        ).all()
+        open_status, color = get_space_status(space)
+        form_values: dict[str, str] = {}
+        form_errors: dict[str, str] = {}
+        message: str | None = None
+        if request.query_params.get("created"):
+            message = "Ticket generated. The space is now reserved for you."
+        elif request.query_params.get("started"):
+            message = "Ticket started. You are now using this space."
+        elif request.query_params.get("ended"):
+            message = "Ticket ended and the booking is now completed."
+        elif request.query_params.get("cancelled"):
+            message = "Booking cancelled. This space is available again."
+        elif request.query_params.get("conflict"):
+            form_errors["form"] = "This space already has an open booking."
+        elif request.query_params.get("invalid"):
+            form_errors["form"] = "Could not complete that action."
+        elif request.query_params.get("forbidden"):
+            form_errors["form"] = "You do not have permission to do that."
+        elif request.query_params.get("not_found"):
+            form_errors["form"] = "That booking was not found."
+
+    active_booking = None
+    if open_status == BookingStatus.ACTIVE:
+        for booking in bookings:
+            if booking.status == BookingStatus.ACTIVE:
+                active_booking = booking
+                break
+
+    return render(
+        request,
+        "customer_space.html",
+        {
+            "lot": lot,
+            "space": space,
+            "get_space_status": get_space_status,
+            "status": open_status,
+            "color": color,
+            "bookings": bookings,
+            "user_id": user.id,
+            "form_values": form_values,
+            "form_errors": form_errors,
+            "message": message,
+            "active_booking": active_booking,
         },
     )
 
@@ -440,6 +975,7 @@ def api_register(payload: Register, request: Request, db: Session = Depends(data
         return JSONResponse(
             status_code=422, content={"detail": "Select a valid state."}
         )
+    payload = payload.model_copy(update={"role": "customer"})
     try:
         user = create_registered_user(db, payload)
     except IntegrityError:
@@ -465,7 +1001,8 @@ async def api_login(
             status_code=400,
             content={"detail": "Please complete the reCAPTCHA."},
         )
-    verified = await recaptcha_is_valid(
+
+    verified = await verify_captcha(
         payload.captcha, request.client.host if request.client else None
     )
     if not verified:
@@ -485,6 +1022,7 @@ async def api_login(
     assert user is not None
     start_session(request, user, remember=payload.remember)
     return APIResponse(message="Sign in successful.", user=user)
+
 
 
 @app.post(
@@ -529,6 +1067,322 @@ def api_reset_password(payload: ResetPassword, db: Session = Depends(database.ge
             },
         )
     return APIResponse(message="Password updated. Sign in with your new password.")
+
+
+@app.post(
+    "/dashboard/lots/{lot_id:int}/spaces/{space_id:int}/book",
+    response_class=HTMLResponse,
+    summary="Create a pending booking for a space",
+)
+async def create_booking(request: Request, lot_id: int, space_id: int) -> HTMLResponse:
+    user = signed_in_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    require_customer(user)
+
+    form = await request.form()
+    values: dict[str, object] = {
+        "start_time": str(form.get("start_time", "")),
+        "end_time": str(form.get("end_time", "")),
+    }
+    errors: dict[str, str] = {}
+
+    try:
+        start_time = parse_datetime(values["start_time"])
+    except ValueError as error:
+        errors["start_time"] = str(error)
+
+    try:
+        end_time = parse_datetime(values["end_time"])
+    except ValueError as error:
+        errors["end_time"] = str(error)
+
+    if not errors:
+        if end_time <= start_time:
+            errors["end_time"] = "End time must be after start time."
+
+    if errors:
+        with database.SessionLocal() as db:
+            space = db.get(ParkingSpace, space_id)
+            lot = space.lot if space else None
+            bookings = []
+            if space:
+                bookings = db.scalars(
+                    select(Booking)
+                    .where(Booking.space_id == space.id)
+                    .order_by(Booking.id)
+                ).all()
+        return render(
+            request,
+            "customer_space.html",
+            {
+                "lot": lot,
+                "space": space,
+                "get_space_status": get_space_status,
+                "status": get_space_status(space)[0] if space else None,
+                "color": get_space_status(space)[1] if space else "green",
+                "bookings": bookings,
+                "user_id": user.id,
+                "form_values": values,
+                "form_errors": errors,
+                "message": None,
+            },
+            400,
+        )
+
+    try:
+        with database.SessionLocal.begin() as db:
+            space = db.get(ParkingSpace, space_id)
+            if not space:
+                return RedirectResponse(
+                    "/dashboard",
+                    status_code=303,
+                )
+            open_status, _ = get_space_status(space)
+            if open_status is not None:
+                raise ValueError("This space already has an open booking.")
+
+            booking = Booking(
+                user_id=user.id,
+                space_id=space.id,
+                start_time=start_time,
+                end_time=end_time,
+                status=BookingStatus.PENDING,
+            )
+            db.add(booking)
+
+        return RedirectResponse(
+            f"/dashboard/lots/{lot_id}/spaces/{space_id}?created=1",
+            status_code=303,
+        )
+
+    except ValueError as error:
+        with database.SessionLocal() as db:
+            space = db.get(ParkingSpace, space_id)
+            lot = space.lot if space else None
+            bookings = []
+            if space:
+                bookings = db.scalars(
+                    select(Booking)
+                    .where(Booking.space_id == space.id)
+                    .order_by(Booking.id)
+                ).all()
+        return render(
+            request,
+            "customer_space.html",
+            {
+                "lot": lot,
+                "space": space,
+                "get_space_status": get_space_status,
+                "status": get_space_status(space)[0] if space else None,
+                "color": get_space_status(space)[1] if space else "green",
+                "bookings": bookings,
+                "user_id": user.id,
+                "form_values": values,
+                "form_errors": {"form": str(error)},
+                "message": None,
+            },
+            400,
+        )
+    except IntegrityError:
+        with database.SessionLocal() as db:
+            space = db.get(ParkingSpace, space_id)
+            lot = space.lot if space else None
+            bookings = []
+            if space:
+                bookings = db.scalars(
+                    select(Booking)
+                    .where(Booking.space_id == space.id)
+                    .order_by(Booking.id)
+                ).all()
+        return RedirectResponse(
+            f"/dashboard/lots/{lot_id}/spaces/{space_id}?conflict=1",
+            status_code=303,
+        )
+    except Exception:
+        logger.exception("Unexpected error while creating booking")
+        with database.SessionLocal() as db:
+            space = db.get(ParkingSpace, space_id)
+            lot = space.lot if space else None
+            bookings = []
+            if space:
+                bookings = db.scalars(
+                    select(Booking)
+                    .where(Booking.space_id == space.id)
+                    .order_by(Booking.id)
+                ).all()
+        return render(
+            request,
+            "customer_space.html",
+            {
+                "lot": lot,
+                "space": space,
+                "get_space_status": get_space_status,
+                "status": get_space_status(space)[0] if space else None,
+                "color": get_space_status(space)[1] if space else "green",
+                "bookings": bookings,
+                "user_id": user.id,
+                "form_values": values,
+                "form_errors": {"form": "An unexpected error occurred. Please try again."},
+                "message": None,
+            },
+            500,
+        )
+
+
+@app.post(
+    "/dashboard/lots/{lot_id:int}/spaces/{space_id:int}/start",
+    response_class=HTMLResponse,
+    summary="Start a pending ticket",
+)
+async def start_booking(request: Request, lot_id: int, space_id: int) -> HTMLResponse:
+    user = signed_in_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    require_customer(user)
+
+    form = await request.form()
+    booking_id_field = str(form.get("booking_id", ""))
+    if not booking_id_field.isdigit():
+        return RedirectResponse(
+            f"/dashboard/lots/{lot_id}/spaces/{space_id}?invalid=1",
+            status_code=303,
+        )
+    booking_id = int(booking_id_field)
+
+    try:
+        with database.SessionLocal.begin() as db:
+            booking = db.get(Booking, booking_id)
+            if not booking or booking.space_id != space_id:
+                return RedirectResponse(
+                    f"/dashboard/lots/{lot_id}/spaces/{space_id}?not_found=1",
+                    status_code=303,
+                )
+            _require_current_user_booking(request, booking)
+            if booking.status != BookingStatus.PENDING:
+                return RedirectResponse(
+                    f"/dashboard/lots/{lot_id}/spaces/{space_id}?invalid=1",
+                    status_code=303,
+                )
+            booking.status = BookingStatus.ACTIVE
+            booking.started_at = now_utc()
+
+        return RedirectResponse(
+            f"/dashboard/lots/{lot_id}/spaces/{space_id}?started=1",
+            status_code=303,
+        )
+
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unexpected error while starting booking")
+        return RedirectResponse(
+            f"/dashboard/lots/{lot_id}/spaces/{space_id}?invalid=1",
+            status_code=303,
+        )
+
+
+@app.post(
+    "/dashboard/lots/{lot_id:int}/spaces/{space_id:int}/end",
+    response_class=HTMLResponse,
+    summary="End an active ticket",
+)
+async def end_booking(request: Request, lot_id: int, space_id: int) -> HTMLResponse:
+    user = signed_in_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    require_customer(user)
+
+    form = await request.form()
+    booking_id_field = str(form.get("booking_id", ""))
+    if not booking_id_field.isdigit():
+        return RedirectResponse(
+            f"/dashboard/lots/{lot_id}/spaces/{space_id}?invalid=1",
+            status_code=303,
+        )
+    booking_id = int(booking_id_field)
+
+    try:
+        with database.SessionLocal.begin() as db:
+            booking = db.get(Booking, booking_id)
+            if not booking or booking.space_id != space_id:
+                return RedirectResponse(
+                    f"/dashboard/lots/{lot_id}/spaces/{space_id}?not_found=1",
+                    status_code=303,
+                )
+            _require_current_user_booking(request, booking)
+            if booking.status != BookingStatus.ACTIVE:
+                return RedirectResponse(
+                    f"/dashboard/lots/{lot_id}/spaces/{space_id}?invalid=1",
+                    status_code=303,
+                )
+            booking.status = BookingStatus.COMPLETED
+            booking.ended_at = now_utc()
+
+        return RedirectResponse(
+            f"/dashboard/lots/{lot_id}/spaces/{space_id}?ended=1",
+            status_code=303,
+        )
+
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unexpected error while ending booking")
+        return RedirectResponse(
+            f"/dashboard/lots/{lot_id}/spaces/{space_id}?invalid=1",
+            status_code=303,
+        )
+
+
+@app.post(
+    "/dashboard/lots/{lot_id:int}/spaces/{space_id:int}/cancel",
+    response_class=HTMLResponse,
+    summary="Cancel a pending booking",
+)
+async def cancel_booking(request: Request, lot_id: int, space_id: int) -> HTMLResponse:
+    user = signed_in_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    require_customer(user)
+
+    form = await request.form()
+    booking_id_field = str(form.get("booking_id", ""))
+    if not booking_id_field.isdigit():
+        return RedirectResponse(
+            f"/dashboard/lots/{lot_id}/spaces/{space_id}?invalid=1",
+            status_code=303,
+        )
+    booking_id = int(booking_id_field)
+
+    try:
+        with database.SessionLocal.begin() as db:
+            booking = db.get(Booking, booking_id)
+            if not booking or booking.space_id != space_id:
+                return RedirectResponse(
+                    f"/dashboard/lots/{lot_id}/spaces/{space_id}?not_found=1",
+                    status_code=303,
+                )
+            _require_current_user_booking(request, booking)
+            if booking.status != BookingStatus.PENDING:
+                return RedirectResponse(
+                    f"/dashboard/lots/{lot_id}/spaces/{space_id}?invalid=1",
+                    status_code=303,
+                )
+            booking.status = BookingStatus.CANCELLED
+
+        return RedirectResponse(
+            f"/dashboard/lots/{lot_id}/spaces/{space_id}?cancelled=1",
+            status_code=303,
+        )
+
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unexpected error while cancelling booking")
+        return RedirectResponse(
+            f"/dashboard/lots/{lot_id}/spaces/{space_id}?invalid=1",
+            status_code=303,
+        )
 
 
 @app.post(
@@ -640,6 +1494,7 @@ async def register(request: Request):
 
     try:
         with database.SessionLocal() as db:
+            payload = payload.model_copy(update={"role": "customer"})
             user = create_registered_user(db, payload)
     except IntegrityError:
         return render(
@@ -725,7 +1580,7 @@ async def login(request: Request):
                 423,
             )
 
-        verified = await recaptcha_is_valid(
+        verified = await verify_captcha(
             payload.captcha, request.client.host if request.client else None
         )
         if not verified:
@@ -754,7 +1609,9 @@ async def login(request: Request):
             )
         assert user is not None
         start_session(request, user, remember=payload.remember)
-        return RedirectResponse("/", status_code=303)
+        if user.role == "admin":
+            return RedirectResponse("/admin", status_code=303)
+        return RedirectResponse("/dashboard", status_code=303)
     except Exception:
         logger.exception("Unexpected error while signing in")
         return render(

@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}{{ lot.name }} | Parking Lots{% endblock %}
+{% block content %}
+<div class="form-heading">
+  <p class="eyebrow form-eyebrow">DASHBOARD</p>
+  <h2>{{ lot.name }}</h2>
+  <p class="form-intro">{{ lot.location }} &middot; {{ lot.total_spaces }} spaces &middot; {{ lot.available_spaces }} available</p>
+</div>
+{% if messages %}
+  {% for message in messages %}
+    <div class="notice notice-success" role="status">{{ message }}</div>
+  {% endfor %}
+{% endif %}
+{% if errors %}
+  {% for error in errors %}
+    <div class="notice notice-error" role="alert">{{ error }}</div>
+  {% endfor %}
+{% endif %}
+{% if spaces %}
+  <div class="space-grid">
+    <h3>Spaces</h3>
+    <div class="grid">
+      {% for space in spaces %}
+        <div class="space-card" data-space-id="{{ space.id }}" role="button" tabindex="0" aria-label="View space {{ space.id }}">
+          <div class="space-name">{{ space.name }}</div>
+          {% if space.notes %}<span class="space-notes">{{ space.notes }}</span>{% endif %}
+          {% set _status, _color = get_space_status(space) %}
+          <span class="space-status space-status--{{ _color }}">
+            {% if _status %}{{ _status.value }}{% else %}Available{% endif %}
+          </span>
+          {% if _status is none and request.session.email %}
+            <a class="text-link" href="/dashboard/lots/{{ lot.id }}/spaces/{{ space.id }}/new">Book</a>
+          {% endif %}
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+{% else %}
+  <p class="form-intro">No spaces in this lot yet.</p>
+{% endif %}
+<p class="text-link"><a href="/dashboard">Back to dashboard</a></p>
+
+{% if space_detail %}
+  <div class="space-modal" id="space-modal" role="dialog" aria-modal="true" aria-labelledby="space-modal-title">
+    <div class="space-modal-card">
+      <button class="space-modal-close" aria-label="Close">×</button>
+      <div class="space-modal-title" id="space-modal-title">Space {{ space_detail.id }}</div>
+      <p class="form-intro"><strong>Name:</strong> {{ space_detail.name }}</p>
+      <p class="form-intro"><strong>Status:</strong>
+        <span class="space-status space-status--{{ space_detail.color }}">
+          {% if space_detail.status %}{{ space_detail.status }}{% else %}Available{% endif %}
+        </span>
+      </p>
+      {% if space_detail.notes %}<p class="form-intro"><strong>Notes:</strong> {{ space_detail.notes }}</p>{% endif %}
+      <p class="form-intro text-link"><a href="/dashboard/lots/{{ lot.id }}">Close</a></p>
+    </div>
+  </div>
+  <script>
+    (function() {
+      var modal = document.getElementById('space-modal');
+      if (!modal) return;
+      function close() { modal.style.display = 'none'; }
+      modal.querySelector('.space-modal-close').addEventListener('click', close);
+      modal.addEventListener('click', function(e) {
+        if (e.target === modal) close();
+      });
+      window.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape' && modal.style.display === 'flex') close();
+      });
+    })();
+  </script>
+{% endif %}
+{% endblock %}

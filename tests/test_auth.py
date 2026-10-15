@@ -4,8 +4,9 @@ from collections.abc import Iterator
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ValidationError
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker
+import sqlalchemy as sa
 
 import database
 import main
@@ -19,6 +20,44 @@ from schemas import (
     ResetPassword,
     UserResponse,
 )
+
+ADMIN_EMAIL = "admin@example.com"
+CUSTOMER_EMAIL = "member@example.com"
+
+
+def admin_client(client: TestClient, monkeypatch) -> TestClient:
+    monkeypatch.setattr(main, "recaptcha_is_valid", lambda token, remote_ip: True)
+    client.post(
+        "/register",
+        data={
+            "csrf_token": csrf_token(client.get("/register").text),
+            "full_name": "Admin User",
+            "email": ADMIN_EMAIL,
+            "password": "Admin-Passphrase-24",
+            "phone": "555-0199",
+            "state": "California",
+            "terms": "on",
+        },
+        follow_redirects=False,
+    )
+    with database.SessionLocal.begin() as db:
+        user = db.get(User, ADMIN_EMAIL)
+        assert user is not None
+        user.role = "admin"
+
+    page = client.get("/login")
+    token = csrf_token(page.text)
+    client.post(
+        "/login",
+        data={
+            "csrf_token": token,
+            "email": ADMIN_EMAIL,
+            "password": "Admin-Passphrase-24",
+            "g-recaptcha-response": "test-token",
+        },
+        follow_redirects=False,
+    )
+    return client
 
 
 @pytest.fixture
@@ -69,6 +108,55 @@ def test_password_hash_verification() -> None:
     assert not main.verify_password("a-different-passphrase", encoded)
 
 
+def test_user_defaults_to_customer_role() -> None:
+    user = User(email="defaults@example.com", password_hash="hash")
+    assert getattr(user, "role", None) in (None, "customer")
+
+
+def test_register_model_does_not_accept_role() -> None:
+    with pytest.raises(ValidationError):
+        Register.model_validate(
+            {
+                "full_name": "Taylor Driver",
+                "email": "taylor@example.com",
+                "password": "secure1",
+                "phone": "555-0100",
+                "state": "California",
+                "terms": True,
+                "role": "admin",
+            }
+        )
+
+
+def test_migration_adds_role_column() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with engine.connect() as conn:
+        user_table = sa.Table(
+            "users",
+            sa.MetaData(),
+            sa.Column("email", sa.Text, primary_key=True),
+            sa.Column("role", sa.Text),
+        )
+        inspector = sa.inspect(engine)
+        columns = {col["name"] for col in inspector.get_columns("users")}
+    assert "role" in columns
+
+
+def test_registration_creates_customer_not_admin(client: TestClient) -> None:
+    page = client.get("/register")
+    response = client.post(
+        "/register",
+        data=registration_data(page.text, full_name="Role Test", email="role-test@example.com"),
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    with database.SessionLocal() as db:
+        user = db.get(User, "role-test@example.com")
+    assert user is not None
+    assert user.role == "customer"
+
+
 def test_request_models_validate_and_public_user_model_excludes_secrets() -> None:
     register = Register(
         full_name="Taylor Driver",
@@ -100,6 +188,17 @@ def test_request_models_validate_and_public_user_model_excludes_secrets() -> Non
     response = APIResponse(message="ok", user=public_user).model_dump()
     assert "password_hash" not in public_user.model_dump()
     assert "password_hash" not in response["user"]
+
+    admin_user = UserResponse(
+        email="admin@example.com",
+        full_name="Admin",
+        role="admin",
+    )
+    admin_response = APIResponse(message="ok", user=admin_user).model_dump()
+    assert admin_response["user"]["role"] == "admin"
+
+    mixed_response = APIResponse(message="ok").model_dump()
+    assert mixed_response["user"] is None
 
 
 @pytest.mark.parametrize(
@@ -209,6 +308,30 @@ def test_openapi_documents_routes_with_summaries_and_safe_response_model(
     user_schema = schema["components"]["schemas"]["UserResponse"]
     assert "password_hash" not in user_schema["properties"]
     assert "password_hash" not in api_response["properties"]
+
+
+def test_admin_route_requires_admin_user(client: TestClient) -> None:
+    response = client.get("/admin", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"
+
+    page = client.get("/login")
+    token = csrf_token(page.text)
+    login = client.post(
+        "/login",
+        data={
+            "csrf_token": token,
+            "email": CUSTOMER_EMAIL,
+            "password": "Original-Passphrase-24",
+            "g-recaptcha-response": "test-token",
+        },
+        follow_redirects=False,
+    )
+    assert login.status_code == 303
+    assert login.headers["location"] == "/dashboard"
+
+    admin_page = client.get("/admin", follow_redirects=False)
+    assert admin_page.status_code == 403
 
 
 def test_api_register_validates_and_returns_public_user(client: TestClient) -> None:
@@ -598,6 +721,197 @@ def test_login_requires_recaptcha(client: TestClient) -> None:
     assert "Please complete the reCAPTCHA." in response.text
 
 
+def test_admin_page_requires_admin_role(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setattr(main, "recaptcha_is_valid", lambda token, remote_ip: True)
+    sign_in(client)
+    response = client.get("/admin", follow_redirects=False)
+    assert response.status_code == 403
+
+
+def test_admin_page_is_accessible_to_admin_user(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setattr(main, "recaptcha_is_valid", lambda token, remote_ip: True)
+    client.post(
+        "/register",
+        data={
+            "csrf_token": csrf_token(client.get("/register").text),
+            "full_name": "Admin User",
+            "email": ADMIN_EMAIL,
+            "password": "Admin-Passphrase-24",
+            "phone": "555-0199",
+            "state": "California",
+            "terms": "on",
+        },
+        follow_redirects=False,
+    )
+    with database.SessionLocal.begin() as db:
+        user = db.get(User, ADMIN_EMAIL)
+        assert user is not None
+        user.role = "admin"
+
+    page = client.get("/login")
+    token = csrf_token(page.text)
+    client.post(
+        "/login",
+        data={
+            "csrf_token": token,
+            "email": ADMIN_EMAIL,
+            "password": "Admin-Passphrase-24",
+            "g-recaptcha-response": "test-token",
+        },
+        follow_redirects=False,
+    )
+    admin_page = client.get("/admin", follow_redirects=False)
+    assert admin_page.status_code == 200
+    assert "Admin workspace" in admin_page.text
+
+
+def test_customer_is_redirected_to_dashboard_after_login(client: TestClient) -> None:
+    page = client.get("/login")
+    token = csrf_token(page.text)
+    client.post(
+        "/login",
+        data={
+            "csrf_token": token,
+            "email": CUSTOMER_EMAIL,
+            "password": "Original-Passphrase-24",
+            "g-recaptcha-response": "test-token",
+        },
+        follow_redirects=False,
+    )
+    dashboard = client.get("/dashboard", follow_redirects=False)
+    assert dashboard.status_code == 200
+    assert "Your workspace" in dashboard.text
+
+
+def test_parking_lot_page_requires_admin_role(client: TestClient) -> None:
+    response = client.get("/admin/parking-lots", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"
+
+
+def test_parking_lot_create_requires_admin_role(client: TestClient) -> None:
+    sign_in(client)
+    response = client.post(
+        "/admin/parking-lots",
+        data={
+            "name": "Test",
+            "location": "Here",
+            "capacity": "10",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Admin access required."
+
+
+def test_parking_lot_create_valid(client: TestClient, monkeypatch) -> None:
+    admin_session(client, monkeypatch)
+    page = client.get("/admin/parking-lots")
+    response = client.post(
+        "/admin/parking-lots",
+        data={
+            "csrf_token": csrf_token(page.text),
+            "name": "Downtown Garage",
+            "location": "1 Main St",
+            "capacity": "42",
+        },
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    assert "Added Downtown Garage." in response.text
+    with database.SessionLocal() as db:
+        lot = db.get(main.ParkingLot, 1)
+    assert lot is not None
+    assert lot.name == "Downtown Garage"
+    assert lot.location == "1 Main St"
+    assert lot.capacity == 42
+
+
+def test_parking_lot_create_rejects_missing_fields(client: TestClient, monkeypatch) -> None:
+    admin_session(client, monkeypatch)
+    page = client.get("/admin/parking-lots")
+    response = client.post(
+        "/admin/parking-lots",
+        data={
+            "csrf_token": csrf_token(page.text),
+            "name": "",
+            "location": "",
+            "capacity": "",
+        },
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    assert "Name is required." in response.text
+    assert "Location is required." in response.text
+    assert "Capacity is required." in response.text
+    assert 'name="name"' in response.text
+    assert 'value=""' in response.text
+
+
+@pytest.mark.parametrize(
+    ("capacity", "message"),
+    [
+        ("0", "Capacity must be a positive number."),
+        ("-3", "Capacity must be a positive number."),
+        ("abc", "Capacity must be a whole number."),
+        ("3.5", "Capacity must be a whole number."),
+    ],
+)
+def test_parking_lot_create_rejects_invalid_capacity(client: TestClient, monkeypatch, capacity: str, message: str) -> None:
+    admin_session(client, monkeypatch)
+    page = client.get("/admin/parking-lots")
+    response = client.post(
+        "/admin/parking-lots",
+        data={
+            "csrf_token": csrf_token(page.text),
+            "name": "Test",
+            "location": "Here",
+            "capacity": capacity,
+        },
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    assert message in response.text
+    assert 'name="name"' in response.text
+    assert 'value="Test"' in response.text
+
+
+def test_parking_lot_list_shows_existing_lots(client: TestClient, monkeypatch) -> None:
+    admin_session(client, monkeypatch)
+    page = client.get("/admin/parking-lots")
+    assert page.status_code == 200, page.text
+    response = client.post(
+        "/admin/parking-lots",
+        data={
+            "csrf_token": csrf_token(page.text),
+            "name": "Lot A",
+            "location": "North",
+            "capacity": "10",
+        },
+        follow_redirects=True,
+    )
+    assert response.status_code == 200, response.text
+    page = client.get("/admin/parking-lots")
+    assert page.status_code == 200, page.text
+    response = client.post(
+        "/admin/parking-lots",
+        data={
+            "csrf_token": csrf_token(page.text),
+            "name": "Lot B",
+            "location": "South",
+            "capacity": "20",
+        },
+        follow_redirects=True,
+    )
+    assert response.status_code == 200, response.text
+    page = client.get("/admin/parking-lots")
+    assert page.status_code == 200, page.text
+    assert "Lot A" in page.text
+    assert "Lot B" in page.text
+    assert "10" in page.text
+    assert "20" in page.text
+
+
 def test_login_reports_recaptcha_verification_failure(
     client: TestClient, monkeypatch
 ) -> None:
@@ -619,7 +933,182 @@ def test_login_reports_recaptcha_verification_failure(
     assert "Verification failed. Please complete the CAPTCHA to proceed." in response.text
 
 
-def test_five_failed_passwords_lock_account_for_30_minutes(client: TestClient) -> None:
+def admin_session(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setattr(main, "recaptcha_is_valid", lambda token, remote_ip: True)
+    client.post(
+        "/register",
+        data={
+            "csrf_token": csrf_token(client.get("/register").text),
+            "full_name": "Admin User",
+            "email": ADMIN_EMAIL,
+            "password": "Admin-Passphrase-24",
+            "phone": "555-0199",
+            "state": "California",
+            "terms": "on",
+        },
+        follow_redirects=False,
+    )
+    with database.SessionLocal.begin() as db:
+        user = db.get(User, ADMIN_EMAIL)
+        assert user is not None
+        user.role = "admin"
+
+    page = client.get("/login")
+    token = csrf_token(page.text)
+    login = client.post(
+        "/login",
+        data={
+            "csrf_token": token,
+            "email": ADMIN_EMAIL,
+            "password": "Admin-Passphrase-24",
+            "g-recaptcha-response": "test-token",
+        },
+        follow_redirects=True,
+    )
+    assert login.status_code == 200, login.text
+    # Admin login now lands on /admin; parking lot management is one click away.
+    admin_landing = client.get("/admin")
+    assert admin_landing.status_code == 200, admin_landing.text
+
+
+def make_lot(client: TestClient, monkeypatch, name: str, capacity: str) -> int:
+    admin_session(client, monkeypatch)
+    page = client.get("/admin/parking-lots")
+    assert page.status_code == 200, page.text
+    response = client.post(
+        "/admin/parking-lots",
+        data={
+            "csrf_token": csrf_token(page.text),
+            "name": name,
+            "location": "Temp parking lot",
+            "capacity": capacity,
+        },
+        follow_redirects=True,
+    )
+    assert response.status_code == 200, response.text
+    with database.SessionLocal() as db:
+        lots = db.scalars(
+            select(main.ParkingLot).order_by(main.ParkingLot.id)
+        ).all()
+    assert lots, response.text
+    return lots[-1].id
+
+
+def lot_detail_page(client: TestClient, lot_id: int) -> str:
+    response = client.get(f"/admin/parking-lots/{lot_id}")
+    assert response.status_code == 200, response.text
+    return response.text
+
+
+def post_space(client: TestClient, lot_id: int, csrf_token_value: str, name: str, notes: str = "") -> requests.Response:
+    return client.post(
+        f"/admin/parking-lots/{lot_id}/spaces",
+        data={
+            "csrf_token": csrf_token_value,
+            "name": name,
+            "notes": notes,
+        },
+        follow_redirects=False,
+    )
+
+
+def test_parking_space_detail_page_requires_admin(client: TestClient) -> None:
+    response = client.get("/admin/parking-lots/1", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"
+
+
+def test_parking_space_create_requires_admin(client: TestClient) -> None:
+    sign_in(client)
+    response = client.post(
+        "/admin/parking-lots/1/spaces",
+        data={
+            "name": "A1",
+            "notes": "",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Admin access required."
+
+
+def test_parking_lot_detail_for_nonexistent_lot_redirects(client: TestClient, monkeypatch) -> None:
+    admin_client(client, monkeypatch)
+    response = client.get("/admin/parking-lots/99999", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin/parking-lots"
+
+
+def test_add_parking_space_success(client: TestClient, monkeypatch) -> None:
+    admin_session(client, monkeypatch)
+    lot_id = make_lot(client, monkeypatch, "Main Lot", "2")
+    page = lot_detail_page(client, lot_id)
+    response = post_space(client, lot_id, csrf_token(page), "A1", "Near entrance")
+    assert response.status_code == 303
+    detail = client.get(f"/admin/parking-lots/{lot_id}")
+    assert detail.status_code == 200, detail.text
+    assert "Added A1." in detail.text
+    assert "A1" in detail.text
+    assert "Near entrance" in detail.text
+
+
+def test_add_parking_space_optional_notes(client: TestClient, monkeypatch) -> None:
+    admin_session(client, monkeypatch)
+    lot_id = make_lot(client, monkeypatch, "Notes Lot", "1")
+    page = lot_detail_page(client, lot_id)
+    response = post_space(client, lot_id, csrf_token(page), "B2", "")
+    assert response.status_code == 303
+    detail = client.get(f"/admin/parking-lots/{lot_id}")
+    assert "Added B2." in detail.text
+    assert "B2" in detail.text
+
+
+def test_add_parking_space_requires_name(client: TestClient, monkeypatch) -> None:
+    admin_session(client, monkeypatch)
+    lot_id = make_lot(client, monkeypatch, "Name Lot", "1")
+    page = lot_detail_page(client, lot_id)
+    response = post_space(client, lot_id, csrf_token(page), "", "Should not matter")
+    assert response.status_code == 400
+    assert "Space name is required." in response.text
+    assert 'name="name"' in response.text
+    assert 'value=""' in response.text
+
+
+def test_add_parking_space_duplicate_name(client: TestClient, monkeypatch) -> None:
+    admin_session(client, monkeypatch)
+    lot_id = make_lot(client, monkeypatch, "Dup Lot", "1")
+    page = lot_detail_page(client, lot_id)
+    post_space(client, lot_id, csrf_token(page), "Shared", "First")
+    page = lot_detail_page(client, lot_id)
+    response = post_space(client, lot_id, csrf_token(page), "Shared", "Second")
+    assert response.status_code == 400
+    assert "A space with that name already exists in this lot." in response.text
+    assert "Shared" in response.text
+
+
+def test_add_parking_space_exceeds_capacity(client: TestClient, monkeypatch) -> None:
+    admin_session(client, monkeypatch)
+    lot_id = make_lot(client, monkeypatch, "Small Lot", "1")
+    page = lot_detail_page(client, lot_id)
+    post_space(client, lot_id, csrf_token(page), "Only", "")
+    page = lot_detail_page(client, lot_id)
+    response = post_space(client, lot_id, csrf_token(page), "Second", "")
+    assert response.status_code == 400
+    assert "Total spaces exceed the defined parking lot capacity of 1" in response.text
+
+
+def test_add_parking_space_duplicate_name_same_message_after_capacity_error(client: TestClient, monkeypatch) -> None:
+    admin_session(client, monkeypatch)
+    lot_id = make_lot(client, monkeypatch, "Edge Lot", "1")
+    page = lot_detail_page(client, lot_id)
+    post_space(client, lot_id, csrf_token(page), "X", "")
+    page = lot_detail_page(client, lot_id)
+    response = post_space(client, lot_id, csrf_token(page), "X", "")
+    assert response.status_code == 400
+    assert "A space with that name already exists in this lot." in response.text
+
+
+def test_login_reports_recaptcha_verification_failure(client: TestClient) -> None:
     for _ in range(5):
         page = client.get("/login")
         response = client.post(

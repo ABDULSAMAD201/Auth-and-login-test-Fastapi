@@ -157,8 +157,29 @@ class UserResponse(BaseModel):
     full_name: str | None = None
     phone: str | None = None
     state: str | None = None
+    role: str | None = None
+
+
+class BookingStatusField(BaseModel):
+    value: str
+    color: str
+
+
+class BookingResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    space_id: int
+    lot_id: int
+    start_time: datetime
+    end_time: datetime
+    status: str
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    status_field: BookingStatusField
 
 
 class APIResponse(BaseModel):
     message: str
     user: UserResponse | None = None
+    redirect_to: str | None = None

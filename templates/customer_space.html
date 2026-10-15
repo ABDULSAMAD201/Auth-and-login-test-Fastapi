@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block title %}{{ space.name }} | Bookings{% endblock %}
+{% block content %}
+<div class="form-heading">
+  <p class="eyebrow form-eyebrow">DASHBOARD</p>
+  <h2>{{ lot.name }} &middot; {{ space.name }}</h2>
+  <p class="form-intro">Space {{ space.id }}</p>
+</div>
+{% if message %}<div class="notice notice-success" role="status">{{ message }}</div>{% endif %}
+{% if form_errors %}
+  {% if form_errors.form %}<div class="notice notice-error" role="alert">{{ form_errors.form }}</div>{% endif %}
+{% endif %}
+{% if space.notes %}<p class="form-intro">{{ space.notes }}</p>{% endif %}
+
+<div class="space-status space-status--{{ color }}">
+  {% if status %}{{ status.value }}{% else %}Available{% endif %}
+</div>
+
+{% if status == 'Active' and active_booking %}
+  <div class="form-intro">
+    Current session: <span id="active-duration" data-started-at="{{ active_booking.started_at.isoformat() }}">calculating…</span>
+  </div>
+{% endif %}
+
+<table class="booking-list">
+  <thead>
+    <tr>
+      <th>Booking</th>
+      <th>Status</th>
+      <th>Start</th>
+      <th>End</th>
+      <th>Started at</th>
+      <th>Ended at</th>
+      <th>Action</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for booking in bookings %}
+      {% set status_color = 'green' %}
+      {% if booking.status.value == 'Pending' %}{% set status_color = 'yellow' %}{% endif %}
+      {% if booking.status.value == 'Active' %}{% set status_color = 'red' %}{% endif %}
+      <tr>
+        <td>{{ booking.id }}</td>
+        <td style="text-transform:capitalize">{{ booking.status.value }}</td>
+        <td>{{ booking.start_time.isoformat() }}</td>
+        <td>{{ booking.end_time.isoformat() }}</td>
+        <td>{{ booking.started_at.isoformat() if booking.started_at else '' }}</td>
+        <td>{{ booking.ended_at.isoformat() if booking.ended_at else '' }}</td>
+        <td>
+          {% if booking.status.value == 'Pending' %}
+            {% if booking.user_id == user_id %}
+              <form class="inline-form" action="/dashboard/lots/{{ lot.id }}/spaces/{{ space.id }}/start" method="post">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="booking_id" value="{{ booking.id }}">
+                <button class="primary-button" type="submit">Start ticket</button>
+              </form>
+              <form class="inline-form" action="/dashboard/lots/{{ lot.id }}/spaces/{{ space.id }}/cancel" method="post">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="booking_id" value="{{ booking.id }}">
+                <button class="secondary-button" type="submit">Cancel</button>
+              </form>
+            {% endif %}
+          {% elif booking.status.value == 'Active' and booking.user_id == user_id %}
+            <form class="inline-form" action="/dashboard/lots/{{ lot.id }}/spaces/{{ space.id }}/end" method="post">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="booking_id" value="{{ booking.id }}">
+              <button class="primary-button" type="submit">End ticket</button>
+            </form>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+{% if status is none %}
+  <form class="auth-form" action="/dashboard/lots/{{ lot.id }}/spaces/{{ space.id }}/book" method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label class="field-label" for="start_time">Start</label>
+    {% if form_errors.start_time %}<p class="field-error" id="start_time-error" role="alert">{{ form_errors.start_time }}</p>{% endif %}
+    <input class="field-control" id="start_time" name="start_time" type="datetime-local" value="{{ form_values.start_time|default('') }}" required>
+    <label class="field-label field-spaced" for="end_time">End</label>
+    {% if form_errors.end_time %}<p class="field-error" id="end_time-error" role="alert">{{ form_errors.end_time }}</p>{% endif %}
+    <input class="field-control" id="end_time" name="end_time" type="datetime-local" value="{{ form_values.end_time|default('') }}" required>
+    <button class="primary-button" type="submit">Generate ticket</button>
+  </form>
+{% endif %}
+
+<p class="text-link"><a href="/dashboard/lots/{{ lot.id }}">Back to {{ lot.name }}</a></p>
+<p class="text-link"><a href="/dashboard">Back to dashboard</a></p>
+{% endblock %}
+
+{% block head %}
+<script>
+(function() {
+  var startedAtEl = document.querySelector('#active-duration[data-started-at]');
+  if (!startedAtEl) return;
+  var startedAt = new Date(startedAtEl.getAttribute('data-started-at'));
+  function pad(n) { return String(n).padStart(2, '0'); }
+  function tick() {
+    var now = new Date();
+    var diffMs = now - startedAt;
+    var totalSeconds = Math.floor(diffMs / 1000);
+    var hours = Math.floor(totalSeconds / 3600);
+    var minutes = Math.floor((totalSeconds % 3600) / 60);
+    var seconds = totalSeconds % 60;
+    startedAtEl.textContent =
+      pad(hours) + ':' + pad(minutes) + ':' + pad(seconds) +
+      ' (since ' + startedAt.toISOString() + ')';
+  }
+  tick();
+  setInterval(tick, 1000);
+})();
+</script>
+{% endblock %}

@@ -1,18 +1,37 @@
 import os
 from collections.abc import Generator
 
+from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+psycopg://postgres@localhost/signin_auth",
+# Load environment variables from the .env file
+load_dotenv()
+
+# Get the database URL from .env
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Check whether DATABASE_URL is configured
+if not DATABASE_URL:
+    raise ValueError(
+        "DATABASE_URL is missing. Please check your .env file."
+    )
+
+# Create the SQLAlchemy engine
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
 )
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+# Create the database session factory
+SessionLocal = sessionmaker(
+    bind=engine,
+    autoflush=False,
+    expire_on_commit=False,
+)
 
 
+# Dependency for FastAPI database sessions
 def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:

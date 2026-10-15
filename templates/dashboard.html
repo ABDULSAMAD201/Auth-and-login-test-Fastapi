@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+<div class="form-heading">
+  <p class="eyebrow form-eyebrow">DASHBOARD</p>
+  <h2>Your workspace</h2>
+  <p class="form-intro">Signed in as {{ email }}.</p>
+</div>
+{% if welcome_message %}<div class="notice notice-success" role="status">{{ welcome_message }}</div>{% endif %}
+{% if lots %}
+  <div class="lot-list">
+    <h3>Parking lots</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Lot</th>
+          <th>Location</th>
+          <th>Spaces</th>
+          <th>Available</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for lot in lots %}
+        <tr>
+          <td>{{ lot.name }}</td>
+          <td>{{ lot.location }}</td>
+          <td>{{ lot.total_spaces }}</td>
+          <td>{{ lot.available_spaces }}</td>
+          <td><a class="text-link" href="/dashboard/lots/{{ lot.id }}">View spaces</a></td>
+          {% if lot.available_spaces|int > 0 %}
+            <td><a class="text-link" href="/dashboard/lots/{{ lot.id }}/spaces/new">Book</a></td>
+          {% endif %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% else %}
+  <p class="form-intro">No parking lots are available yet.</p>
+{% endif %}
+{% if messages %}
+  {% for message in messages %}
+    <div class="notice notice-success" role="status">{{ message }}</div>
+  {% endfor %}
+{% endif %}
+{% if errors %}
+  {% for error in errors %}
+    <div class="notice notice-error" role="alert">{{ error }}</div>
+  {% endfor %}
+{% endif %}
+{% endblock %}

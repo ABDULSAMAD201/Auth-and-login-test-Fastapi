@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}{{ lot.name }} | Parking Lots{% endblock %}
+{% block content %}
+<div class="form-heading">
+  <p class="eyebrow form-eyebrow">ADMIN</p>
+  <h2>{{ lot.name }}</h2>
+  <p class="form-intro">{{ lot.location }} &middot; capacity {{ lot.capacity }}</p>
+</div>
+{% if request.query_params.get('added') %}<div class="notice notice-success" role="status">Added {{ request.query_params.get('added') }}.</div>{% endif %}
+{% if success %}<div class="notice notice-success" role="status">{{ success }}</div>{% endif %}
+{% if form_errors %}
+  {% if form_errors.form %}<div class="notice notice-error" role="alert">{{ form_errors.form }}</div>{% endif %}
+{% endif %}
+<form class="auth-form space-form" action="/admin/parking-lots/{{ lot.id }}/spaces" method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <label class="field-label" for="space-name">Space name</label>
+  {% if form_errors.name %}<p class="field-error" id="space-name-error" role="alert">{{ form_errors.name }}</p>{% endif %}
+  <input class="field-control" id="space-name" name="name" type="text" value="{{ form_values.name|default('') }}" aria-invalid="{{ 'true' if form_errors.name else 'false' }}" {% if form_errors.name %}aria-describedby="space-name-error"{% endif %} required>
+  <label class="field-label field-spaced" for="space-notes">Notes</label>
+  <textarea class="field-control" id="space-notes" name="notes" rows="2" placeholder="Optional">{{ form_values.notes|default('') }}</textarea>
+  <button class="primary-button" type="submit">Add space <span aria-hidden="true">→</span></button>
+</form>
+{% if spaces %}
+<div class="space-grid">
+  <h3>Spaces ({{ spaces|length }})</h3>
+  <div class="grid">
+    {% for space in spaces %}
+      <div class="space-card">
+        <span class="space-name">{{ space.name }}</span>
+        {% if space.notes %}<span class="space-notes">{{ space.notes }}</span>{% endif %}
+      </div>
+    {% endfor %}
+  </div>
+</div>
+{% else %}
+<p class="form-intro">No spaces added yet.</p>
+{% endif %}
+<p class="text-link"><a href="/admin/parking-lots">Back to parking lots</a></p>
+{% endblock %}

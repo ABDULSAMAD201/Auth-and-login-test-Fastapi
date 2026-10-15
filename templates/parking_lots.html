@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Parking Lots{% endblock %}
+{% block content %}
+<div class="form-heading">
+  <p class="eyebrow form-eyebrow">ADMIN</p>
+  <h2>Parking lots</h2>
+  <p class="form-intro">Manage parking lot inventory.</p>
+</div>
+{% if success %}<div class="notice notice-success" role="status">{{ success }}</div>{% endif %}
+{% set _form_errors = form_errors if form_errors is defined else {} %}
+{% set _form_values = form_values if form_values is defined else {'name': '', 'location': '', 'capacity': ''} %}
+<form class="auth-form" action="/admin/parking-lots" method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <label class="field-label" for="name">Name</label>
+  {% if _form_errors.name %}<p class="field-error" id="name-error" role="alert">{{ _form_errors.name }}</p>{% endif %}
+  <input class="field-control" id="name" name="name" type="text" value="{{ _form_values.name|default('') }}" aria-invalid="{{ 'true' if _form_errors.name else 'false' }}" {% if _form_errors.name %}aria-describedby="name-error"{% endif %} required>
+  <label class="field-label field-spaced" for="location">Location</label>
+  {% if _form_errors.location %}<p class="field-error" id="location-error" role="alert">{{ _form_errors.location }}</p>{% endif %}
+  <input class="field-control" id="location" name="location" type="text" value="{{ _form_values.location|default('') }}" aria-invalid="{{ 'true' if _form_errors.location else 'false' }}" {% if _form_errors.location %}aria-describedby="location-error"{% endif %} required>
+  <label class="field-label field-spaced" for="capacity">Capacity</label>
+  {% if _form_errors.capacity %}<p class="field-error" id="capacity-error" role="alert">{{ _form_errors.capacity }}</p>{% endif %}
+  <input class="field-control" id="capacity" name="capacity" type="number" min="1" step="1" value="{{ _form_values.capacity|default('') }}" aria-invalid="{{ 'true' if _form_errors.capacity else 'false' }}" {% if _form_errors.capacity %}aria-describedby="capacity-error"{% endif %} required>
+  <button class="primary-button" type="submit">Add parking lot <span aria-hidden="true">→</span></button>
+</form>
+{% if parking_lots %}
+<div class="lot-list">
+  <h3>Existing parking lots</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Location</th>
+        <th>Capacity</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for lot in parking_lots %}
+      <tr>
+        <td>{{ lot.name }}</td>
+        <td>{{ lot.location }}</td>
+        <td>{{ lot.capacity }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Admin{% endblock %}
+{% block content %}
+<div class="form-heading">
+  <p class="eyebrow form-eyebrow">ADMIN</p>
+  <h2>Admin workspace</h2>
+  <p class="form-intro">Signed in as {{ full_name }}.</p>
+</div>
+<p class="form-intro">Admin features go here.</p>
+<p class="form-intro"><a class="text-link" href="/admin/parking-lots">Manage parking lots</a></p>
+{% endblock %}
