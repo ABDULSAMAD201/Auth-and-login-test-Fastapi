@@ -49,6 +49,153 @@ def test_password_hash_verification() -> None:
     assert not main.verify_password("a-different-passphrase", encoded)
 
 
+def registration_data(page_text: str, **overrides: str) -> dict[str, str]:
+    data = {
+        "csrf_token": csrf_token(page_text),
+        "full_name": "Taylor Driver",
+        "email": "taylor@example.com",
+        "password": "secure1",
+        "phone": "555-0100",
+        "state": "California",
+        "terms": "on",
+    }
+    data.update(overrides)
+    return data
+
+
+def test_registration_page_has_required_fields_and_google_link(client: TestClient) -> None:
+    response = client.get("/register")
+    assert response.status_code == 200
+    for expected in (
+        'name="full_name"',
+        'name="email"',
+        'name="password"',
+        'name="phone"',
+        'name="state"',
+        'name="terms"',
+        "Register",
+        'href="/login">Sign In',
+        "Sign up with Google",
+    ):
+        assert expected in response.text
+    assert "Select your state" in response.text
+
+
+def test_registration_creates_user_and_starts_session(client: TestClient) -> None:
+    page = client.get("/register")
+    response = client.post(
+        "/register", data=registration_data(page.text), follow_redirects=False
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/?welcome=1"
+
+    user = main.get_user("taylor@example.com")
+    assert user is not None
+    assert user["full_name"] == "Taylor Driver"
+    assert user["phone"] == "555-0100"
+    assert user["state"] == "California"
+    assert user["terms_accepted_at"] is not None
+    assert main.verify_password("secure1", user["password_hash"])
+    assert client.get("/").status_code == 200
+    welcome = client.get("/?welcome=1")
+    assert "Welcome, Taylor Driver!" in welcome.text
+
+
+def test_registration_rejects_duplicate_email(client: TestClient) -> None:
+    page = client.get("/register")
+    response = client.post(
+        "/register",
+        data=registration_data(page.text, email=" MEMBER@example.com "),
+    )
+    assert response.status_code == 409
+    assert "An account with this email already exists." in response.text
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("full_name", "", "Field is required."),
+        ("email", "", "Field is required."),
+        ("password", "", "Field is required."),
+        ("phone", "", "Field is required."),
+        ("state", "", "Field is required."),
+        ("state", "Not a state", "Select a valid state."),
+        ("password", "12345", "Password must be at least 6 characters."),
+        (
+            "terms",
+            "",
+            "You must accept the terms and conditions to register.",
+        ),
+    ],
+)
+def test_registration_validation_messages(
+    client: TestClient, field: str, value: str, message: str
+) -> None:
+    page = client.get("/register")
+    response = client.post(
+        "/register",
+        data=registration_data(page.text, **{field: value}),
+    )
+    assert response.status_code == 400
+    assert message in response.text
+
+
+def test_google_registration_prefills_identity_and_uses_session_email(
+    client: TestClient, monkeypatch
+) -> None:
+    class GoogleClient:
+        async def authorize_access_token(self, request):
+            return {
+                "userinfo": {
+                    "email": "google@example.com",
+                    "email_verified": True,
+                    "name": "Google Member",
+                }
+            }
+
+    monkeypatch.setattr(main.oauth, "google", GoogleClient(), raising=False)
+    callback = client.get("/auth/google/callback", follow_redirects=False)
+    assert callback.status_code == 303
+    assert callback.headers["location"] == "/register"
+
+    page = client.get("/register")
+    assert 'value="Google Member"' in page.text
+    assert 'value="google@example.com" readonly' in page.text
+    response = client.post(
+        "/register",
+        data=registration_data(
+            page.text,
+            full_name="Google Member",
+            email="attacker@example.com",
+        ),
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert main.get_user("google@example.com") is not None
+    assert main.get_user("attacker@example.com") is None
+    assert "Welcome, Google Member!" in client.get("/?welcome=1").text
+
+
+def test_google_sign_in_logs_in_existing_account(
+    client: TestClient, monkeypatch
+) -> None:
+    class GoogleClient:
+        async def authorize_access_token(self, request):
+            return {
+                "userinfo": {
+                    "email": "member@example.com",
+                    "email_verified": True,
+                    "name": "Existing Member",
+                }
+            }
+
+    monkeypatch.setattr(main.oauth, "google", GoogleClient(), raising=False)
+    response = client.get("/auth/google/callback", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+    assert client.get("/").status_code == 200
+
+
 def test_login_requires_csrf(client: TestClient) -> None:
     response = client.post("/login", data={"email": "member@example.com", "password": "wrong"})
     assert response.status_code == 403

@@ -53,6 +53,13 @@ button, input { font: inherit; }
 .auth-form { display: flex; flex-direction: column; }
 .field-label { margin: 0 0 8px; color: #394741; font-size: 12px; font-weight: 700; }
 .field-error { margin: 0 0 8px; color: var(--danger); font-size: 12px; }
+.field-control { width: 100%; min-height: 48px; padding: 0 12px; border: 1px solid #d9dfd9; border-radius: 4px; background: rgba(255,255,255,.7); color: var(--ink); font: inherit; font-size: 13px; }
+.field-control:focus { outline: 0; border-color: #638c77; box-shadow: 0 0 0 3px rgba(99,140,119,.12); }
+.field-control[readonly] { background: #f0f2ed; color: #68766d; }
+.field-spaced { margin-top: 16px; }
+.terms-field { margin: 18px 0; }
+.terms-field .field-error { margin: 7px 0 0 25px; }
+.register-signin { margin: 19px 0 0; color: var(--muted); text-align: center; font-size: 12px; }
 .label-row { display: flex; align-items: center; justify-content: space-between; margin-top: 19px; }
 .label-row .field-label { margin: 0 0 8px; }
 .text-link, .back-link { color: #477363; text-decoration: none; font-size: 12px; font-weight: 700; }

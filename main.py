@@ -32,6 +32,18 @@ REGULAR_SESSION_LENGTH = 60 * 60 * 8
 RESET_TOKEN_LENGTH = 60 * 30
 SIGN_IN_MAX_FAILED_ATTEMPTS = 5
 SIGN_IN_LOCKOUT_LENGTH = 60 * 30
+US_STATES = (
+    "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado",
+    "Connecticut", "Delaware", "Florida", "Georgia", "Hawaii", "Idaho",
+    "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky", "Louisiana",
+    "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota",
+    "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada",
+    "New Hampshire", "New Jersey", "New Mexico", "New York",
+    "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon",
+    "Pennsylvania", "Rhode Island", "South Carolina", "South Dakota",
+    "Tennessee", "Texas", "Utah", "Vermont", "Virginia", "Washington",
+    "West Virginia", "Wisconsin", "Wyoming", "District of Columbia",
+)
 logger = logging.getLogger("signin_auth")
 
 
@@ -54,6 +66,10 @@ def initialize_database() -> None:
         )
         existing = {r["name"] for r in connection.execute("PRAGMA table_info(users)")}
         for column, ddl in {
+            "full_name": "TEXT",
+            "phone": "TEXT",
+            "state": "TEXT",
+            "terms_accepted_at": "INTEGER",
             "failed_attempts": "INTEGER NOT NULL DEFAULT 0",
             "locked_until": "INTEGER",
             "session_version": "INTEGER NOT NULL DEFAULT 0",
@@ -145,6 +161,19 @@ def signed_in_user(request: Request):
         request.session.clear()
         return None
     return user
+
+
+def start_session(
+    request: Request, user: sqlite3.Row, remember: bool = False
+) -> None:
+    request.session.clear()
+    request.session["email"] = user["email"]
+    request.session["sv"] = user["session_version"]
+    request.session["expires_at"] = int(time.time()) + (
+        SESSION_LENGTH if remember else REGULAR_SESSION_LENGTH
+    )
+    create_csrf_token(request)
+
 
 #sends people to /login .Status code 303 means "See Other",
 #which tells the client to make a GET request to the new URL.
@@ -256,7 +285,152 @@ async def home(request: Request):
     user = signed_in_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
-    return render(request, "account.html", {"email": user["email"]})
+    return render(
+        request,
+        "account.html",
+        {
+            "email": user["email"],
+            "welcome_message": (
+                f"Welcome, {user['full_name']}!" if request.query_params.get("welcome") else ""
+            ),
+        },
+    )
+
+
+@app.get("/register", response_class=HTMLResponse)
+async def register_page(request: Request):
+    if request.session.get("email") and signed_in_user(request):
+        return RedirectResponse("/", status_code=303)
+    google_registration = request.session.get("google_registration", {})
+    return render(
+        request,
+        "register.html",
+        {
+            "full_name": google_registration.get("name", ""),
+            "email": google_registration.get("email", ""),
+            "google_registration": bool(google_registration.get("email")),
+            "states": US_STATES,
+        },
+    )
+
+
+@app.post("/register", response_class=HTMLResponse)
+async def register(request: Request):
+    form = await request.form()
+    google_registration = request.session.get("google_registration", {})
+    google_email = str(google_registration.get("email", "")).strip().lower()
+    full_name = str(form.get("full_name", "")).strip()
+    if google_email and not full_name:
+        full_name = str(google_registration.get("name", "")).strip()
+    email = google_email or str(form.get("email", "")).strip().lower()
+    password = str(form.get("password", ""))
+    phone = str(form.get("phone", "")).strip()
+    state = str(form.get("state", "")).strip()
+
+    if not csrf_is_valid(request, form):
+        return render(
+            request,
+            "register.html",
+            {
+                "error": "Your session expired. Please try again.",
+                "full_name": full_name,
+                "email": email,
+                "phone": phone,
+                "state": state,
+                "google_registration": bool(google_email),
+                "states": US_STATES,
+            },
+            403,
+        )
+
+    field_errors: dict[str, str] = {}
+    for field, value in (
+        ("full_name", full_name),
+        ("email", email),
+        ("password", password),
+        ("phone", phone),
+        ("state", state),
+    ):
+        if not value:
+            field_errors[field] = "Field is required."
+    terms_accepted = form.get("terms") == "on"
+    if not terms_accepted:
+        field_errors["terms"] = (
+            "You must accept the terms and conditions to register."
+        )
+    if password and len(password) < 6:
+        field_errors["password"] = "Password must be at least 6 characters."
+    if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        field_errors["email"] = "Invalid email format."
+    if state and state not in US_STATES:
+        field_errors["state"] = "Select a valid state."
+
+    context: dict[str, object] = {
+        "field_errors": field_errors,
+        "full_name": full_name,
+        "email": email,
+        "phone": phone,
+        "state": state,
+        "terms_checked": terms_accepted,
+        "google_registration": bool(google_email),
+        "states": US_STATES,
+    }
+    if field_errors:
+        return render(request, "register.html", context, 400)
+
+    try:
+        with connect_db() as connection:
+            connection.execute(
+                """INSERT INTO users
+                   (email, password_hash, full_name, phone, state, terms_accepted_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    email,
+                    hash_password(password),
+                    full_name,
+                    phone,
+                    state,
+                    int(time.time()),
+                ),
+            )
+            user = connection.execute(
+                "SELECT * FROM users WHERE email = ?", (email,)
+            ).fetchone()
+    except sqlite3.IntegrityError:
+        return render(
+            request,
+            "register.html",
+            {
+                **context,
+                "error": "An account with this email already exists.",
+            },
+            409,
+        )
+    except Exception:
+        logger.exception("Unexpected error while registering account")
+        return render(
+            request,
+            "register.html",
+            {
+                **context,
+                "error": "An unexpected error occurred. Please try again later.",
+            },
+            500,
+        )
+
+    if not user:
+        logger.error("Newly created account could not be loaded: %s", email)
+        return render(
+            request,
+            "register.html",
+            {
+                **context,
+                "error": "An unexpected error occurred. Please try again later.",
+            },
+            500,
+        )
+    start_session(request, user)
+    return RedirectResponse("/?welcome=1", status_code=303)
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -360,14 +534,7 @@ async def login(request: Request):
                 (email,),
             )
 
-        remember = form.get("remember") == "on"
-        request.session.clear()
-        request.session["email"] = email
-        request.session["sv"] = user["session_version"]
-        request.session["expires_at"] = int(time.time()) + (
-            SESSION_LENGTH if remember else REGULAR_SESSION_LENGTH
-        )
-        create_csrf_token(request)
+        start_session(request, user, remember=form.get("remember") == "on")
         return RedirectResponse("/", status_code=303)
     except Exception:
         logger.exception("Unexpected error while signing in")
@@ -524,15 +691,17 @@ async def google_callback(request: Request):
     if not email or not profile.get("email_verified"):
         return redirect_to_login("Google could not verify your email address.")
     user = get_user(email)
-    if not user:
-        return redirect_to_login("That Google account is not registered for this portal.")
+    if user:
+        start_session(request, user)
+        return RedirectResponse("/", status_code=303)
 
     request.session.clear()
-    request.session["email"] = email
-    request.session["sv"] = user["session_version"]
-    request.session["expires_at"] = int(time.time()) + REGULAR_SESSION_LENGTH
+    request.session["google_registration"] = {
+        "email": email,
+        "name": str(profile.get("name", "")).strip(),
+    }
     create_csrf_token(request)
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse("/register", status_code=303)
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

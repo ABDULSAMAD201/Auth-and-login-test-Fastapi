@@ -3,6 +3,7 @@
 {% block content %}
 <div class="account-topline"><p class="eyebrow form-eyebrow">NORTHSTAR WORKSPACE</p><span class="status-pill"><span></span> Secure session</span></div>
 <div class="form-heading account-heading"><h2>You’re signed in.</h2><p class="form-intro">Welcome back to your workspace.</p></div>
+{% if welcome_message %}<div class="notice notice-success" role="status">{{ welcome_message }}</div>{% endif %}
 <section class="account-summary" aria-label="Account details"><div class="avatar">{{ email[0]|upper }}</div><div><p class="summary-label">SIGNED IN AS</p><p class="account-email">{{ email }}</p></div></section>
 <div class="account-actions"><a class="primary-button action-link" href="/change-password">Change password <span aria-hidden="true">→</span></a><form action="/logout" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="secondary-button" type="submit">Sign out</button></form></div>
 <div class="security-note"><span class="security-icon" aria-hidden="true">✓</span><p><strong>Your account is protected</strong><br>Password updates end your current session and require you to sign in again.</p></div>

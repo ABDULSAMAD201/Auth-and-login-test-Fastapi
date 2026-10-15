@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Register{% endblock %}
+{% block content %}
+<div class="form-heading">
+  <p class="eyebrow form-eyebrow">GET STARTED</p>
+  <h2>Create your account</h2>
+  <p class="form-intro">Register to access your parking workspace.</p>
+</div>
+{% if error %}<div class="notice notice-error" role="alert">{{ error }}</div>{% endif %}
+<form class="auth-form" action="/register" method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+  <label class="field-label" for="full_name">Full name</label>
+  {% if field_errors.full_name %}<p class="field-error" id="full_name-error" role="alert">{{ field_errors.full_name }}</p>{% endif %}
+  <input class="field-control" id="full_name" name="full_name" type="text" autocomplete="name" value="{{ full_name|default('') }}" aria-invalid="{{ 'true' if field_errors.full_name else 'false' }}" {% if field_errors.full_name %}aria-describedby="full_name-error"{% endif %} required>
+
+  <label class="field-label field-spaced" for="email">Email address</label>
+  {% if field_errors.email %}<p class="field-error" id="email-error" role="alert">{{ field_errors.email }}</p>{% endif %}
+  <input class="field-control" id="email" name="email" type="email" autocomplete="email" value="{{ email|default('') }}" {% if google_registration %}readonly{% endif %} aria-invalid="{{ 'true' if field_errors.email else 'false' }}" {% if field_errors.email %}aria-describedby="email-error"{% endif %} required>
+
+  <label class="field-label field-spaced" for="password">Password</label>
+  {% if field_errors.password %}<p class="field-error" id="password-error" role="alert">{{ field_errors.password }}</p>{% endif %}
+  <input class="field-control" id="password" name="password" type="password" autocomplete="new-password" minlength="6" aria-invalid="{{ 'true' if field_errors.password else 'false' }}" {% if field_errors.password %}aria-describedby="password-error"{% endif %} required>
+
+  <label class="field-label field-spaced" for="phone">Phone number</label>
+  {% if field_errors.phone %}<p class="field-error" id="phone-error" role="alert">{{ field_errors.phone }}</p>{% endif %}
+  <input class="field-control" id="phone" name="phone" type="tel" autocomplete="tel" value="{{ phone|default('') }}" aria-invalid="{{ 'true' if field_errors.phone else 'false' }}" {% if field_errors.phone %}aria-describedby="phone-error"{% endif %} required>
+
+  <label class="field-label field-spaced" for="state">State</label>
+  {% if field_errors.state %}<p class="field-error" id="state-error" role="alert">{{ field_errors.state }}</p>{% endif %}
+  <select class="field-control" id="state" name="state" aria-invalid="{{ 'true' if field_errors.state else 'false' }}" {% if field_errors.state %}aria-describedby="state-error"{% endif %} required>
+    <option value="">Select your state</option>
+    {% for state_option in states %}<option value="{{ state_option }}" {% if state == state_option %}selected{% endif %}>{{ state_option }}</option>{% endfor %}
+  </select>
+
+  <div class="terms-field">
+    <label class="check-label"><input type="checkbox" name="terms" {% if terms_checked %}checked{% endif %}><span class="check-box" aria-hidden="true"></span><span>I accept the Terms and Conditions</span></label>
+    {% if field_errors.terms %}<p class="field-error" id="terms-error" role="alert">{{ field_errors.terms }}</p>{% endif %}
+  </div>
+  <button class="primary-button" type="submit">Register <span aria-hidden="true">→</span></button>
+</form>
+<div class="divider"><span>OR CONTINUE WITH</span></div>
+<a class="google-button{% if not google_enabled %} google-disabled{% endif %}" href="/auth/google"{% if not google_enabled %} aria-label="Sign up with Google (not configured)"{% endif %}><svg viewBox="0 0 20 20" aria-hidden="true"><path fill="#4285F4" d="M18.4 10.2c0-.6-.1-1.2-.2-1.8H10v3.4h4.7a4 4 0 0 1-1.8 2.6v2.2h2.9c1.7-1.6 2.6-3.8 2.6-6.4Z"/><path fill="#34A853" d="M10 18.7c2.4 0 4.4-.8 5.8-2.1l-2.9-2.2c-.8.5-1.7.8-2.9.8-2.2 0-4.1-1.5-4.8-3.5H2.2v2.3a8.7 8.7 0 0 0 7.8 4.7Z"/><path fill="#FBBC05" d="M5.2 11.7a5.2 5.2 0 0 1 0-3.4V6H2.2a8.7 8.7 0 0 0 0 8l3-2.3Z"/><path fill="#EA4335" d="M10 4.8c1.3 0 2.5.5 3.4 1.3L16 3.5A8.5 8.5 0 0 0 10 1.2 8.7 8.7 0 0 0 2.2 6l3 2.3c.7-2 2.6-3.5 4.8-3.5Z"/></svg>Sign up with Google{% if not google_enabled %}<span class="setup-note">Setup needed</span>{% endif %}</a>
+<p class="register-signin">Already have an account? <a class="text-link" href="/login">Sign In</a></p>
+{% endblock %}

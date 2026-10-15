@@ -12,7 +12,7 @@ python create_user.py you@example.com
 uvicorn main:app --reload
 ```
 
-Open http://127.0.0.1:8000. The first registered user is created through the CLI; there is no public account-creation route. Passwords must be at least 12 characters.
+Open http://127.0.0.1:8000. Users can register through `/register`; passwords must be at least 6 characters. Existing accounts can still be provisioned through the CLI.
 
 In local development, reCAPTCHA verification is visibly marked as bypassed. Reset links are written to the application log when email is not configured. Google sign-in is shown but redirects back with a setup message until OAuth credentials are provided.
 
@@ -32,7 +32,7 @@ Set these environment variables before starting the server:
 | `SMTP_USER` / `SMTP_PASSWORD` | Optional SMTP credentials |
 | `SMTP_FROM` | Optional sender address; defaults to `SMTP_USER` |
 
-For production, configure HTTPS at the reverse proxy, set a stable `SECRET_KEY` and `PUBLIC_BASE_URL`, Google OAuth and reCAPTCHA credentials, and SMTP delivery. The reset endpoint intentionally returns the same message whether an account exists or not. Google sign-in is restricted to email addresses already provisioned in the users table.
+For production, configure HTTPS at the reverse proxy, set a stable `SECRET_KEY` and `PUBLIC_BASE_URL`, Google OAuth and reCAPTCHA credentials, and SMTP delivery. The reset endpoint intentionally returns the same message whether an account exists or not. Google sign-in logs in existing accounts and guides new Google users through registration.
 
 ## Test
 
