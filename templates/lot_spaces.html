@@ -1,73 +1,42 @@
 {% extends "base.html" %}
-{% block title %}{{ lot.name }} | Parking Lots{% endblock %}
+{% block title %}{{ lot.name }} | Parking{% endblock %}
+{% block wrap_class %}wide-form-wrap{% endblock %}
 {% block content %}
 <div class="form-heading">
   <p class="eyebrow form-eyebrow">DASHBOARD</p>
   <h2>{{ lot.name }}</h2>
-  <p class="form-intro">{{ lot.location }} &middot; {{ lot.total_spaces }} spaces &middot; {{ lot.available_spaces }} available</p>
+  <p class="form-intro">
+    {{ lot.location }} &middot;
+    <span data-lot-total="{{ lot.id }}">{{ lot.total_spaces }}</span> spaces &middot;
+    <span data-lot-available="{{ lot.id }}">{{ lot.available_spaces }}</span> available
+  </p>
 </div>
-{% if messages %}
-  {% for message in messages %}
-    <div class="notice notice-success" role="status">{{ message }}</div>
-  {% endfor %}
-{% endif %}
-{% if errors %}
-  {% for error in errors %}
-    <div class="notice notice-error" role="alert">{{ error }}</div>
-  {% endfor %}
-{% endif %}
-{% if spaces %}
-  <div class="space-grid">
-    <h3>Spaces</h3>
-    <div class="grid">
-      {% for space in spaces %}
-        <div class="space-card" data-space-id="{{ space.id }}" role="button" tabindex="0" aria-label="View space {{ space.id }}">
-          <div class="space-name">{{ space.name }}</div>
-          {% if space.notes %}<span class="space-notes">{{ space.notes }}</span>{% endif %}
-          {% set _status, _color = get_space_status(space) %}
-          <span class="space-status space-status--{{ _color }}">
-            {% if _status %}{{ _status.value }}{% else %}Available{% endif %}
-          </span>
-          {% if _status is none and request.session.email %}
-            <a class="text-link" href="/dashboard/lots/{{ lot.id }}/spaces/{{ space.id }}/new">Book</a>
-          {% endif %}
-        </div>
-      {% endfor %}
-    </div>
-  </div>
-{% else %}
-  <p class="form-intro">No spaces in this lot yet.</p>
-{% endif %}
-<p class="text-link"><a href="/dashboard">Back to dashboard</a></p>
 
-{% if space_detail %}
-  <div class="space-modal" id="space-modal" role="dialog" aria-modal="true" aria-labelledby="space-modal-title">
-    <div class="space-modal-card">
-      <button class="space-modal-close" aria-label="Close">×</button>
-      <div class="space-modal-title" id="space-modal-title">Space {{ space_detail.id }}</div>
-      <p class="form-intro"><strong>Name:</strong> {{ space_detail.name }}</p>
-      <p class="form-intro"><strong>Status:</strong>
-        <span class="space-status space-status--{{ space_detail.color }}">
-          {% if space_detail.status %}{{ space_detail.status }}{% else %}Available{% endif %}
-        </span>
-      </p>
-      {% if space_detail.notes %}<p class="form-intro"><strong>Notes:</strong> {{ space_detail.notes }}</p>{% endif %}
-      <p class="form-intro text-link"><a href="/dashboard/lots/{{ lot.id }}">Close</a></p>
-    </div>
+<div class="legend" aria-label="Space status legend">
+  <span class="legend-item"><span class="legend-swatch legend-swatch--green"></span> Available — generate a ticket</span>
+  <span class="legend-item"><span class="legend-swatch legend-swatch--yellow"></span> Pending booking</span>
+  <span class="legend-item"><span class="legend-swatch legend-swatch--red"></span> Active booking</span>
+</div>
+
+{% if space_views %}
+<div class="grid" data-spaces-grid data-lot-id="{{ lot.id }}" data-spaces-url="/api/lots/{{ lot.id }}/spaces">
+  {% for space in space_views %}
+  <div class="space-card space-card--{{ space.color }}" data-space-id="{{ space.id }}" data-space-name="{{ space.name }}" data-space-notes="{{ space.notes or '' }}" data-space-status="{{ space.status or '' }}" data-space-color="{{ space.color }}" data-space-url="/dashboard/lots/{{ lot.id }}/spaces/{{ space.id }}" role="button" tabindex="0" aria-label="Space {{ space.name }}, {{ space.status or 'Available' }}">
+    <span class="space-name">{{ space.name }}</span>
+    {% if space.notes %}<span class="space-notes">{{ space.notes }}</span>{% endif %}
+    <span class="space-status space-status--{{ space.color }}" data-space-status-label>{{ space.status or 'Available' }}</span>
   </div>
-  <script>
-    (function() {
-      var modal = document.getElementById('space-modal');
-      if (!modal) return;
-      function close() { modal.style.display = 'none'; }
-      modal.querySelector('.space-modal-close').addEventListener('click', close);
-      modal.addEventListener('click', function(e) {
-        if (e.target === modal) close();
-      });
-      window.addEventListener('keydown', function(e) {
-        if (e.key === 'Escape' && modal.style.display === 'flex') close();
-      });
-    })();
-  </script>
+  {% endfor %}
+</div>
+<p class="muted">Select a space to see its ID, name, status and notes. The grid refreshes every 5 seconds.</p>
+{% else %}
+<p class="empty-state">This parking lot has no spaces yet. Please check back later.</p>
 {% endif %}
+
+<div class="section">
+  <p class="form-intro">
+    <a class="text-link" href="/dashboard">Back to dashboard</a> &middot;
+    <a class="text-link" href="/dashboard/bookings">My bookings and tickets</a>
+  </p>
+</div>
 {% endblock %}

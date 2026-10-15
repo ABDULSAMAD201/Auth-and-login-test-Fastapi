@@ -1,115 +1,120 @@
 {% extends "base.html" %}
-{% block title %}{{ space.name }} | Bookings{% endblock %}
+{% block title %}{{ space.name }} | {{ lot.name }}{% endblock %}
 {% block content %}
 <div class="form-heading">
   <p class="eyebrow form-eyebrow">DASHBOARD</p>
   <h2>{{ lot.name }} &middot; {{ space.name }}</h2>
-  <p class="form-intro">Space {{ space.id }}</p>
-</div>
-{% if message %}<div class="notice notice-success" role="status">{{ message }}</div>{% endif %}
-{% if form_errors %}
-  {% if form_errors.form %}<div class="notice notice-error" role="alert">{{ form_errors.form }}</div>{% endif %}
-{% endif %}
-{% if space.notes %}<p class="form-intro">{{ space.notes }}</p>{% endif %}
-
-<div class="space-status space-status--{{ color }}">
-  {% if status %}{{ status.value }}{% else %}Available{% endif %}
+  <p class="form-intro">{{ lot.location }}</p>
 </div>
 
-{% if status == 'Active' and active_booking %}
-  <div class="form-intro">
-    Current session: <span id="active-duration" data-started-at="{{ active_booking.started_at.isoformat() }}">calculating…</span>
+{% if flash.message %}<div class="notice {{ 'notice-error' if flash.kind == 'error' else 'notice-success' }}" role="{{ 'alert' if flash.kind == 'error' else 'status' }}">{{ flash.message }}</div>{% endif %}
+{% set values = form_values|default({}, true) %}
+
+<div class="space-status space-status--{{ space.color }}">{{ space.status or 'Available' }}</div>
+
+<div class="section">
+  <div class="table-wrap">
+    <table class="data-table">
+      <caption>Space details</caption>
+      <tbody>
+        <tr><th scope="row">Space ID</th><td>{{ space.id }}</td></tr>
+        <tr><th scope="row">Name</th><td>{{ space.name }}</td></tr>
+        <tr><th scope="row">Status</th><td>{{ space.status or 'Available' }}</td></tr>
+        <tr><th scope="row">Notes</th><td>{{ space.notes or '—' }}</td></tr>
+      </tbody>
+    </table>
   </div>
+</div>
+
+{% if active_booking %}
+<div class="notice notice-warning" role="status">
+  Current session: <span id="active-duration" data-started-at="{{ active_booking.started_at.isoformat() }}">calculating…</span>
+</div>
 {% endif %}
 
-<table class="booking-list">
-  <thead>
-    <tr>
-      <th>Booking</th>
-      <th>Status</th>
-      <th>Start</th>
-      <th>End</th>
-      <th>Started at</th>
-      <th>Ended at</th>
-      <th>Action</th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for booking in bookings %}
-      {% set status_color = 'green' %}
-      {% if booking.status.value == 'Pending' %}{% set status_color = 'yellow' %}{% endif %}
-      {% if booking.status.value == 'Active' %}{% set status_color = 'red' %}{% endif %}
-      <tr>
-        <td>{{ booking.id }}</td>
-        <td style="text-transform:capitalize">{{ booking.status.value }}</td>
-        <td>{{ booking.start_time.isoformat() }}</td>
-        <td>{{ booking.end_time.isoformat() }}</td>
-        <td>{{ booking.started_at.isoformat() if booking.started_at else '' }}</td>
-        <td>{{ booking.ended_at.isoformat() if booking.ended_at else '' }}</td>
-        <td>
-          {% if booking.status.value == 'Pending' %}
-            {% if booking.user_id == user_id %}
+{% if space.status == 'Pending' and active_booking is none and my_bookings %}
+  <p class="form-intro">This space is reserved by a pending booking. Start it when you arrive.</p>
+{% elif space.status and active_booking is none %}
+  <p class="form-intro">This space is currently occupied by another customer. It becomes available again once that booking is completed or cancelled.</p>
+{% endif %}
+
+{% if my_bookings %}
+<div class="section">
+  <h3>Your tickets for this space</h3>
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th scope="col">Ticket</th>
+          <th scope="col">Status</th>
+          <th scope="col">Start</th>
+          <th scope="col">End</th>
+          <th scope="col">Started at</th>
+          <th scope="col">Ended at</th>
+          <th scope="col">Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for booking in my_bookings %}
+        <tr>
+          <td>#{{ booking.id }}</td>
+          <td><span class="space-status space-status--{{ 'yellow' if booking.status.value == 'Pending' else ('red' if booking.status.value == 'Active' else 'green') }}">{{ booking.status.value }}</span></td>
+          <td>{{ booking.start_time }}</td>
+          <td>{{ booking.end_time }}</td>
+          <td>{{ booking.started_at or '—' }}</td>
+          <td>{{ booking.ended_at or '—' }}</td>
+          <td>
+            {% if booking.status.value == 'Pending' %}
+            <div class="row-actions">
               <form class="inline-form" action="/dashboard/lots/{{ lot.id }}/spaces/{{ space.id }}/start" method="post">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <input type="hidden" name="booking_id" value="{{ booking.id }}">
-                <button class="primary-button" type="submit">Start ticket</button>
+                <button class="primary-button compact-button" type="submit">Start ticket</button>
               </form>
-              <form class="inline-form" action="/dashboard/lots/{{ lot.id }}/spaces/{{ space.id }}/cancel" method="post">
+              <form class="inline-form" action="/dashboard/lots/{{ lot.id }}/spaces/{{ space.id }}/cancel" method="post" data-confirm="Cancel this booking and release the space?">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <input type="hidden" name="booking_id" value="{{ booking.id }}">
                 <button class="secondary-button" type="submit">Cancel</button>
               </form>
-            {% endif %}
-          {% elif booking.status.value == 'Active' and booking.user_id == user_id %}
-            <form class="inline-form" action="/dashboard/lots/{{ lot.id }}/spaces/{{ space.id }}/end" method="post">
+            </div>
+            {% elif booking.status.value == 'Active' %}
+            <form class="inline-form" action="/dashboard/lots/{{ lot.id }}/spaces/{{ space.id }}/end" method="post" data-confirm="End this ticket and mark the booking complete?">
               <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
               <input type="hidden" name="booking_id" value="{{ booking.id }}">
-              <button class="primary-button" type="submit">End ticket</button>
+              <button class="primary-button compact-button" type="submit">End ticket</button>
             </form>
-          {% endif %}
-        </td>
-      </tr>
-    {% endfor %}
-  </tbody>
-</table>
-
-{% if status is none %}
-  <form class="auth-form" action="/dashboard/lots/{{ lot.id }}/spaces/{{ space.id }}/book" method="post">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label class="field-label" for="start_time">Start</label>
-    {% if form_errors.start_time %}<p class="field-error" id="start_time-error" role="alert">{{ form_errors.start_time }}</p>{% endif %}
-    <input class="field-control" id="start_time" name="start_time" type="datetime-local" value="{{ form_values.start_time|default('') }}" required>
-    <label class="field-label field-spaced" for="end_time">End</label>
-    {% if form_errors.end_time %}<p class="field-error" id="end_time-error" role="alert">{{ form_errors.end_time }}</p>{% endif %}
-    <input class="field-control" id="end_time" name="end_time" type="datetime-local" value="{{ form_values.end_time|default('') }}" required>
-    <button class="primary-button" type="submit">Generate ticket</button>
-  </form>
+            {% else %}&mdash;{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
 {% endif %}
 
-<p class="text-link"><a href="/dashboard/lots/{{ lot.id }}">Back to {{ lot.name }}</a></p>
-<p class="text-link"><a href="/dashboard">Back to dashboard</a></p>
-{% endblock %}
+{% if space.status is none %}
+<div class="section">
+  <h3>Generate ticket</h3>
+  <form class="auth-form" action="/dashboard/lots/{{ lot.id }}/spaces/{{ space.id }}/book" method="post" data-create-booking data-space-url="/dashboard/lots/{{ lot.id }}/spaces/{{ space.id }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div data-booking-feedback hidden></div>
+    <label class="field-label" for="start_time">Start</label>
+    {% if form_errors.start_time %}<p class="field-error" role="alert">{{ form_errors.start_time }}</p>{% endif %}
+    <input class="field-control" id="start_time" name="start_time" type="datetime-local" value="{{ values.start_time|default('') }}" required>
+    <label class="field-label field-spaced" for="end_time">End</label>
+    {% if form_errors.end_time %}<p class="field-error" role="alert">{{ form_errors.end_time }}</p>{% endif %}
+    <input class="field-control" id="end_time" name="end_time" type="datetime-local" value="{{ values.end_time|default('') }}" required>
+    <button class="primary-button" type="submit">Generate ticket <span aria-hidden="true">→</span></button>
+  </form>
+</div>
+{% endif %}
 
-{% block head %}
-<script>
-(function() {
-  var startedAtEl = document.querySelector('#active-duration[data-started-at]');
-  if (!startedAtEl) return;
-  var startedAt = new Date(startedAtEl.getAttribute('data-started-at'));
-  function pad(n) { return String(n).padStart(2, '0'); }
-  function tick() {
-    var now = new Date();
-    var diffMs = now - startedAt;
-    var totalSeconds = Math.floor(diffMs / 1000);
-    var hours = Math.floor(totalSeconds / 3600);
-    var minutes = Math.floor((totalSeconds % 3600) / 60);
-    var seconds = totalSeconds % 60;
-    startedAtEl.textContent =
-      pad(hours) + ':' + pad(minutes) + ':' + pad(seconds) +
-      ' (since ' + startedAt.toISOString() + ')';
-  }
-  tick();
-  setInterval(tick, 1000);
-})();
-</script>
+<div class="section">
+  <p class="form-intro">
+    <a class="text-link" href="/dashboard/lots/{{ lot.id }}">Back to {{ lot.name }}</a> &middot;
+    <a class="text-link" href="/dashboard/bookings">My bookings</a> &middot;
+    <a class="text-link" href="/dashboard">Dashboard</a>
+  </p>
+</div>
 {% endblock %}

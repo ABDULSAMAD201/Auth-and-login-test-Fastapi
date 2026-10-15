@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}My bookings{% endblock %}
+{% block wrap_class %}wide-form-wrap{% endblock %}
+{% block content %}
+<div class="form-heading">
+  <p class="eyebrow form-eyebrow">DASHBOARD</p>
+  <h2>My bookings and tickets</h2>
+  <p class="form-intro">Start, end or cancel your own parking tickets.</p>
+</div>
+
+{% if flash.message %}<div class="notice {{ 'notice-error' if flash.kind == 'error' else 'notice-success' }}" role="{{ 'alert' if flash.kind == 'error' else 'status' }}">{{ flash.message }}</div>{% endif %}
+
+{% if booking_rows %}
+<div class="table-wrap">
+  <table class="data-table">
+    <caption>Your bookings</caption>
+    <thead>
+      <tr>
+        <th scope="col">Ticket</th>
+        <th scope="col">Lot</th>
+        <th scope="col">Space</th>
+        <th scope="col">Start</th>
+        <th scope="col">End</th>
+        <th scope="col">Started at</th>
+        <th scope="col">Ended at</th>
+        <th scope="col">Status</th>
+        <th scope="col">Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in booking_rows %}
+      <tr>
+        <td>#{{ row.id }}</td>
+        <td>{{ row.lot_name }}</td>
+        <td>{{ row.space_name }}</td>
+        <td>{{ row.start_time }}</td>
+        <td>{{ row.end_time }}</td>
+        <td>{{ row.started_at or '—' }}</td>
+        <td>{{ row.ended_at or '—' }}</td>
+        <td><span class="space-status space-status--{{ row.color }}">{{ row.status }}</span></td>
+        <td>
+          {% if row.status == 'Pending' %}
+          <div class="row-actions">
+            <form class="inline-form" action="/dashboard/lots/{{ row.lot_id }}/spaces/{{ row.space_id }}/start" method="post">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="booking_id" value="{{ row.id }}">
+              <input type="hidden" name="redirect_to" value="bookings">
+              <button class="primary-button compact-button" type="submit">Start ticket</button>
+            </form>
+            <form class="inline-form" action="/dashboard/lots/{{ row.lot_id }}/spaces/{{ row.space_id }}/cancel" method="post" data-confirm="Cancel booking #{{ row.id }} and release the space?">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="booking_id" value="{{ row.id }}">
+              <input type="hidden" name="redirect_to" value="bookings">
+              <button class="secondary-button" type="submit">Cancel</button>
+            </form>
+          </div>
+          {% elif row.status == 'Active' %}
+          <form class="inline-form" action="/dashboard/lots/{{ row.lot_id }}/spaces/{{ row.space_id }}/end" method="post" data-confirm="End ticket #{{ row.id }} and complete the booking?">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="booking_id" value="{{ row.id }}">
+            <input type="hidden" name="redirect_to" value="bookings">
+            <button class="primary-button compact-button" type="submit">End ticket</button>
+          </form>
+          {% else %}
+          <span class="muted">&mdash;</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p class="empty-state">You have no bookings yet. <a class="text-link" href="/dashboard">Browse parking lots</a> to generate a ticket.</p>
+{% endif %}
+
+<div class="section">
+  <p class="form-intro">
+    <a class="text-link" href="/dashboard">Back to dashboard</a> &middot;
+    <a class="text-link" href="/dashboard/bookings">Refresh</a>
+  </p>
+</div>
+{% endblock %}

@@ -1,10 +1,12 @@
 import re
 from collections.abc import Iterator
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 import sqlalchemy as sa
 
@@ -180,10 +182,13 @@ def test_request_models_validate_and_public_user_model_excludes_secrets() -> Non
         confirm_password="long-enough-password",
     )
 
-    public_user = UserResponse(
-        email="member@example.com",
-        full_name="Member",
-        password_hash="must-not-appear",
+    # A row that carries a hash must not leak it through the public schema.
+    public_user = UserResponse.model_validate(
+        {
+            "email": "member@example.com",
+            "full_name": "Member",
+            "password_hash": "must-not-appear",
+        }
     )
     response = APIResponse(message="ok", user=public_user).model_dump()
     assert "password_hash" not in public_user.model_dump()
@@ -840,7 +845,7 @@ def test_parking_lot_create_rejects_missing_fields(client: TestClient, monkeypat
         },
         follow_redirects=True,
     )
-    assert response.status_code == 200
+    assert response.status_code == 400
     assert "Name is required." in response.text
     assert "Location is required." in response.text
     assert "Capacity is required." in response.text
@@ -870,7 +875,7 @@ def test_parking_lot_create_rejects_invalid_capacity(client: TestClient, monkeyp
         },
         follow_redirects=True,
     )
-    assert response.status_code == 200
+    assert response.status_code == 400
     assert message in response.text
     assert 'name="name"' in response.text
     assert 'value="Test"' in response.text
@@ -1000,7 +1005,13 @@ def lot_detail_page(client: TestClient, lot_id: int) -> str:
     return response.text
 
 
-def post_space(client: TestClient, lot_id: int, csrf_token_value: str, name: str, notes: str = "") -> requests.Response:
+def post_space(
+    client: TestClient,
+    lot_id: int,
+    csrf_token_value: str,
+    name: str,
+    notes: str = "",
+) -> httpx.Response:
     return client.post(
         f"/admin/parking-lots/{lot_id}/spaces",
         data={
@@ -1108,7 +1119,7 @@ def test_add_parking_space_duplicate_name_same_message_after_capacity_error(clie
     assert "A space with that name already exists in this lot." in response.text
 
 
-def test_login_reports_recaptcha_verification_failure(client: TestClient) -> None:
+def test_account_locks_after_repeated_failed_logins(client: TestClient) -> None:
     for _ in range(5):
         page = client.get("/login")
         response = client.post(
@@ -1127,6 +1138,7 @@ def test_login_reports_recaptcha_verification_failure(client: TestClient) -> Non
         user = db.get(User, "member@example.com")
         assert user is not None
     assert user.failed_attempts == 5
+    assert user.locked_until is not None
     assert user.locked_until - int(main.time.time()) in range(1798, 1801)
 
     page = client.get("/login")

@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Tickets | Admin{% endblock %}
+{% block wrap_class %}wide-form-wrap{% endblock %}
+{% block content %}
+<div class="form-heading">
+  <p class="eyebrow form-eyebrow">ADMIN</p>
+  <h2>Tickets</h2>
+  <p class="form-intro">Every booking that is currently Pending or Active. The list refreshes automatically.</p>
+</div>
+
+<div class="table-wrap" data-tickets-table {% if not ticket_rows %}hidden{% endif %}>
+  <table class="data-table">
+    <caption>Open tickets (booking ID serves as the ticket ID)</caption>
+    <thead>
+      <tr>
+        <th scope="col">Ticket</th>
+        <th scope="col">Customer</th>
+        <th scope="col">Booking ID</th>
+        <th scope="col">Lot</th>
+        <th scope="col">Space</th>
+        <th scope="col">Status</th>
+        <th scope="col">Scheduled start</th>
+        <th scope="col">Scheduled end</th>
+        <th scope="col">Started at</th>
+        <th scope="col">Ended at</th>
+      </tr>
+    </thead>
+    <tbody data-tickets-body data-tickets-url="/api/admin/tickets">
+      {% for row in ticket_rows %}
+      <tr data-ticket-id="{{ row.id }}">
+        <td><strong>#{{ row.id }}</strong></td>
+        <td><span class="cell-stack">{{ row.customer_name }}</span><span class="cell-sub">{{ row.customer_email }}</span></td>
+        <td>#{{ row.id }}</td>
+        <td>{{ row.lot_name }}</td>
+        <td>{{ row.space_name }}</td>
+        <td><span class="space-status space-status--{{ row.status_field.color }}">{{ row.status_field.value }}</span></td>
+        <td>{{ row.start_time }}</td>
+        <td>{{ row.end_time }}</td>
+        <td>{{ row.started_at or '—' }}</td>
+        <td>{{ row.ended_at or '—' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<p class="empty-state" data-tickets-empty {% if ticket_rows %}hidden{% endif %}>No pending or active tickets right now.</p>
+
+<div class="section">
+  <p class="form-intro">
+    <a class="text-link" href="/admin/bookings">Booking management</a> &middot;
+    <a class="text-link" href="/admin">Back to admin dashboard</a>
+  </p>
+</div>
+{% endblock %}

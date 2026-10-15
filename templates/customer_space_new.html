@@ -4,27 +4,31 @@
 <div class="form-heading">
   <p class="eyebrow form-eyebrow">DASHBOARD</p>
   <h2>{{ lot.name }} &middot; {{ space.name }}</h2>
-  <p class="form-intro">Space {{ space.id }}</p>
+  <p class="form-intro">Space {{ space.id }} &middot; {{ lot.location }}</p>
 </div>
-{% if message %}<div class="notice notice-success" role="status">{{ message }}</div>{% endif %}
-{% if form_errors %}
-  {% if form_errors.form %}<div class="notice notice-error" role="alert">{{ form_errors.form }}</div>{% endif %}
-{% endif %}
-{% if space.notes %}<p class="form-intro">{{ space.notes }}</p>{% endif %}
 
 <div class="space-status space-status--green">Available</div>
+{% if space.notes %}<p class="form-intro">Notes: {{ space.notes }}</p>{% endif %}
 
-<form class="auth-form" action="/dashboard/lots/{{ lot.id }}/spaces/{{ space.id }}/book" method="post">
+<form class="auth-form" action="/dashboard/lots/{{ lot.id }}/spaces/{{ space.id }}/book" method="post" data-create-booking data-space-url="/dashboard/lots/{{ lot.id }}/spaces/{{ space.id }}">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div data-booking-feedback hidden></div>
   <label class="field-label" for="start_time">Start</label>
   {% if form_errors.start_time %}<p class="field-error" id="start_time-error" role="alert">{{ form_errors.start_time }}</p>{% endif %}
   <input class="field-control" id="start_time" name="start_time" type="datetime-local" value="{{ form_values.start_time|default('') }}" required>
   <label class="field-label field-spaced" for="end_time">End</label>
   {% if form_errors.end_time %}<p class="field-error" id="end_time-error" role="alert">{{ form_errors.end_time }}</p>{% endif %}
   <input class="field-control" id="end_time" name="end_time" type="datetime-local" value="{{ form_values.end_time|default('') }}" required>
-  <button class="primary-button" type="submit">Generate ticket</button>
+  <button class="primary-button" type="submit">Generate ticket <span aria-hidden="true">→</span></button>
 </form>
 
-<p class="text-link"><a href="/dashboard/lots/{{ lot.id }}">Back to {{ lot.name }}</a></p>
-<p class="text-link"><a href="/dashboard">Back to dashboard</a></p>
+<p class="muted">Times are entered and stored in UTC. A generated ticket is Pending until you start it.</p>
+
+<div class="section">
+  <p class="form-intro">
+    <a class="text-link" href="/dashboard/lots/{{ lot.id }}/spaces/{{ space.id }}">Space details and ticket actions</a> &middot;
+    <a class="text-link" href="/dashboard/lots/{{ lot.id }}">Back to {{ lot.name }}</a> &middot;
+    <a class="text-link" href="/dashboard">Dashboard</a>
+  </p>
+</div>
 {% endblock %}

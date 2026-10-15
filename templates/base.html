@@ -9,93 +9,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}">
-  <style>
-    .space-status {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      font-weight: 600;
-      padding: 4px 10px;
-      border-radius: 999px;
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-    }
-    .space-status--green {
-      background: #e3f3e6;
-      color: #1f6b3a;
-    }
-    .space-status--yellow {
-      background: #fdf3d8;
-      color: #8a6200;
-    }
-    .space-status--red {
-      background: #fbe6e4;
-      color: #a8312a;
-    }
-    .space-card {
-      border: 1px solid #e6e6e2;
-      border-radius: 12px;
-      padding: 12px;
-      cursor: pointer;
-    }
-    .space-card:hover {
-      border-color: #c9c9c3;
-      background: #fafaf7;
-    }
-    .space-card-knockout {
-      position: absolute;
-      inset: 0;
-    }
-    .space-name {
-      font-weight: 600;
-      letter-spacing: 0.02em;
-    }
-    .space-notes {
-      display: block;
-      margin-top: 6px;
-      color: #60605c;
-      font-size: 13px;
-    }
-    .space-meta {
-      margin-top: 10px;
-      font-size: 12px;
-      color: #60605c;
-      word-break: break-word;
-    }
-    .space-modal {
-      position: fixed;
-      left: 0;
-      top: 0;
-      right: 0;
-      bottom: 0;
-      background: rgba(20, 20, 18, 0.5);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      z-index: 100;
-    }
-    .space-modal-card {
-      background: #ffffff;
-      border-radius: 16px;
-      padding: 18px;
-      width: 90%;
-      max-width: 380px;
-      box-shadow: 0 18px 50px rgba(0,0,0,0.18);
-    }
-    .space-modal-title {
-      font-weight: 700;
-      margin-bottom: 8px;
-    }
-    .space-modal-close {
-      background: transparent;
-      border: none;
-      font-size: 20px;
-      line-height: 1;
-      cursor: pointer;
-      color: #60605c;
-    }
-  </style>
+  <link rel="stylesheet" href="{{ url_for('static', path='/parking.css') }}">
   {% block head %}{% endblock %}
 </head>
 <body>
@@ -122,7 +36,27 @@
     </aside>
     <section class="content-panel">
       <div class="mobile-brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 36 36" fill="none"><path d="M18 3.5 31 10v9.1c0 7.1-5.3 11.8-13 14.4C10.3 30.9 5 26.2 5 19.1V10l13-6.5Z" stroke="currentColor" stroke-width="1.8"/><path d="m12.5 18.2 3.6 3.6 7.6-8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="brand-name">northstar<span class="brand-period">.</span></span></div>
-      <div class="form-wrap">{% block content %}{% endblock %}</div>
+      {% if nav_user %}
+      <nav class="site-nav" aria-label="Main navigation">
+        {% if nav_user.role == 'admin' %}
+          <a href="/admin">Admin dashboard</a>
+          <a href="/admin/parking-lots">Parking lots</a>
+          <a href="/admin/bookings">Bookings</a>
+          <a href="/admin/tickets">Tickets</a>
+        {% else %}
+          <a href="/dashboard">Dashboard</a>
+          <a href="/dashboard/bookings">My bookings</a>
+        {% endif %}
+        <span class="nav-spacer"></span>
+        <span class="nav-role">{{ nav_user.role }}</span>
+        <a href="/">Account</a>
+        <form class="inline-form" action="/logout" method="post">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="text-link" type="submit" style="border:0;background:none;padding:0;cursor:pointer;font:inherit;font-weight:700;">Sign out</button>
+        </form>
+      </nav>
+      {% endif %}
+      <div class="{% block wrap_class %}form-wrap{% endblock %}">{% block content %}{% endblock %}</div>
       <footer class="content-footer"><span>© 2026 Northstar</span><a href="mailto:support@example.com">Need help?</a></footer>
     </section>
   </main>

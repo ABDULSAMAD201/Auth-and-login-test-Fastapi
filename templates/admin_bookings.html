@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block title %}Bookings | Admin{% endblock %}
+{% block wrap_class %}wide-form-wrap{% endblock %}
+{% block content %}
+<div class="form-heading">
+  <p class="eyebrow form-eyebrow">ADMIN</p>
+  <h2>Booking management</h2>
+  <p class="form-intro">Filter bookings by parking lot, cancel eligible bookings or move a booking to another space and time.</p>
+</div>
+
+{% if flash.message %}<div class="notice {{ 'notice-error' if flash.kind == 'error' else 'notice-success' }}" role="{{ 'alert' if flash.kind == 'error' else 'status' }}">{{ flash.message }}</div>{% endif %}
+
+<form class="filter-form" action="/admin/bookings" method="get">
+  <div>
+    <label class="field-label" for="lot_id">Filter by parking lot</label>
+    <select class="field-control" id="lot_id" name="lot_id">
+      <option value="">All parking lots</option>
+      {% for lot in lots %}
+      <option value="{{ lot.id }}" {% if selected_lot == lot.id %}selected{% endif %}>{{ lot.name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <button class="secondary-button" type="submit">Apply filter</button>
+  {% if selected_lot %}<a class="text-link" href="/admin/bookings">Clear filter</a>{% endif %}
+</form>
+
+{% if booking_rows %}
+<div class="table-wrap">
+  <table class="data-table">
+    <caption>Bookings</caption>
+    <thead>
+      <tr>
+        <th scope="col">Customer</th>
+        <th scope="col">Booking ID</th>
+        <th scope="col">Lot</th>
+        <th scope="col">Space</th>
+        <th scope="col">Start</th>
+        <th scope="col">End</th>
+        <th scope="col">Status</th>
+        <th scope="col">Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in booking_rows %}
+      <tr>
+        <td>
+          <span class="cell-stack">{{ row.customer_name }}</span>
+          <span class="cell-sub">{{ row.customer_email }}</span>
+          {% if row.customer_phone %}<span class="cell-sub">{{ row.customer_phone }}</span>{% endif %}
+        </td>
+        <td>#{{ row.id }}</td>
+        <td>{{ row.lot_name }}</td>
+        <td>{{ row.space_name }}</td>
+        <td>{{ row.start_time }}</td>
+        <td>{{ row.end_time }}</td>
+        <td><span class="space-status space-status--{{ row.color }}">{{ row.status }}</span></td>
+        <td>
+          {% if row.is_open %}
+          <div class="row-actions">
+            <form class="inline-form" action="/admin/bookings/{{ row.id }}/cancel" method="post" data-confirm="Cancel booking #{{ row.id }} and release the space?">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="lot_id" value="{{ selected_lot or '' }}">
+              <button class="secondary-button" type="submit">Cancel</button>
+            </form>
+          </div>
+          <details class="edit-details">
+            <summary>Modify</summary>
+            <form class="edit-form" action="/admin/bookings/{{ row.id }}/update" method="post">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="lot_id" value="{{ selected_lot or '' }}">
+              <label class="field-label" for="space-{{ row.id }}">Parking space</label>
+              <select class="field-control" id="space-{{ row.id }}" name="space_id" required>
+                {% for option in space_options %}
+                <option value="{{ option.id }}" {% if option.id == row.space_id %}selected{% endif %}>{{ option.label }}</option>
+                {% endfor %}
+              </select>
+              <label class="field-label" for="start-{{ row.id }}">Start</label>
+              <input class="field-control" id="start-{{ row.id }}" name="start_time" type="datetime-local" value="{{ row.start_time.strftime('%Y-%m-%dT%H:%M') }}" required>
+              <label class="field-label" for="end-{{ row.id }}">End</label>
+              <input class="field-control" id="end-{{ row.id }}" name="end_time" type="datetime-local" value="{{ row.end_time.strftime('%Y-%m-%dT%H:%M') }}" required>
+              <button class="primary-button compact-button" type="submit">Save changes</button>
+            </form>
+          </details>
+          {% else %}
+          <span class="muted">No actions</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p class="empty-state">
+  {% if selected_lot %}
+    No bookings match the selected parking lot.
+  {% else %}
+    No bookings have been made yet.
+  {% endif %}
+</p>
+{% endif %}
+
+<div class="section">
+  <p class="form-intro"><a class="text-link" href="/admin">Back to admin dashboard</a></p>
+</div>
+{% endblock %}

@@ -9,13 +9,17 @@ from sqlalchemy.orm import Session, sessionmaker
 load_dotenv()
 
 # Get the database URL from .env
-DATABASE_URL = os.getenv("DATABASE_URL")
+_database_url = os.getenv("DATABASE_URL")
 
 # Check whether DATABASE_URL is configured
-if not DATABASE_URL:
+if not _database_url:
     raise ValueError(
         "DATABASE_URL is missing. Please check your .env file."
     )
+
+#: Non-empty once the check above passes; annotated so callers (and type
+#: checkers) can rely on it being a plain string.
+DATABASE_URL: str = _database_url
 
 # Create the SQLAlchemy engine
 engine = create_engine(

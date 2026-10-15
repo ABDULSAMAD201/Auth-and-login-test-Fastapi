@@ -1,26 +1,19 @@
 from datetime import datetime, timezone
 from enum import Enum
-from sqlalchemy import DateTime, ForeignKey, Integer, Text, Index, text
-import sqlalchemy as sa
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy.sql.schema import UniqueConstraint
 
-
-def is_space_available(space: ParkingSpace) -> bool:
-    """True when the space has no open (Pending/Active) bookings."""
-    return get_space_status(space)[0] is None
-
-
-def is_space_available_for_capacity(lot: ParkingLot, db: Session) -> bool:
-    """True when adding one more space to lot would not exceed capacity."""
-    existing_count = db.scalar(
-        select(func.count()).select_from(ParkingSpace).where(
-            ParkingSpace.lot_id == lot.id
-        )
-    )
-    count = int(existing_count) if existing_count is not None else 0
-    return count + 1 <= lot.capacity
-
+from sqlalchemy import (
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Text,
+    UniqueConstraint,
+    func,
+    select,
+    text,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
+from sqlalchemy.types import TypeDecorator
 
 
 class Base(DeclarativeBase):
@@ -34,16 +27,58 @@ class BookingStatus(str, Enum):
     CANCELLED = "Cancelled"
 
 
+#: Statuses that keep a parking space occupied.
+OPEN_BOOKING_STATUSES = (BookingStatus.PENDING, BookingStatus.ACTIVE)
+
+#: Displayed colour for each open booking status. Spaces without an open
+#: booking are green.
+STATUS_COLORS = {
+    BookingStatus.PENDING: "yellow",
+    BookingStatus.ACTIVE: "red",
+}
+AVAILABLE_COLOR = "green"
+
+
 def now_utc() -> datetime:
+    """Current time as a timezone-aware UTC datetime.
+
+    Every booking timestamp in the application is stored in UTC; the only
+    conversion happens when the browser renders a ``datetime-local`` value.
+    """
     return datetime.now(timezone.utc)
+
+
+class BookingStatusType(TypeDecorator):
+    """Persist :class:`BookingStatus` as plain text, return enum members.
+
+    Keeping the column as text preserves the existing schema while letting the
+    application compare against ``BookingStatus`` members directly.
+    """
+
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value: object, dialect) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, BookingStatus):
+            return value.value
+        return BookingStatus(str(value)).value
+
+    def process_result_value(self, value: object, dialect) -> BookingStatus | None:
+        if value is None:
+            return None
+        if isinstance(value, BookingStatus):
+            return value
+        return BookingStatus(str(value))
 
 
 class User(Base):
     __tablename__ = "users"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-
-    email: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    # The users table uses the email address as its primary key; this mirrors
+    # the existing production schema and keeps existing accounts intact.
+    email: Mapped[str] = mapped_column(Text, primary_key=True)
     password_hash: Mapped[str] = mapped_column(Text, nullable=False)
     reset_token_hash: Mapped[str | None] = mapped_column(Text)
     reset_expires_at: Mapped[int | None] = mapped_column(Integer)
@@ -61,7 +96,11 @@ class User(Base):
     role: Mapped[str] = mapped_column(
         Text,
         nullable=False,
-        server_default=text("customer"),
+        server_default=text("'customer'"),
+    )
+
+    bookings: Mapped[list["Booking"]] = relationship(
+        back_populates="user", order_by="Booking.id", cascade="all, delete-orphan"
     )
 
 
@@ -106,8 +145,10 @@ class Booking(Base):
     __tablename__ = "bookings"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"),
+    # References the User primary key (the account email address).
+    user_id: Mapped[str] = mapped_column(
+        Text,
+        ForeignKey("users.email", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
@@ -115,12 +156,16 @@ class Booking(Base):
         ForeignKey("parking_spaces.id", ondelete="CASCADE"),
         nullable=False,
     )
-    start_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    end_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    start_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    end_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
     status: Mapped[BookingStatus] = mapped_column(
-        Text,
+        BookingStatusType,
         nullable=False,
-        server_default=text("Pending"),
+        server_default=text("'Pending'"),
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -130,31 +175,100 @@ class Booking(Base):
         server_default=text("CURRENT_TIMESTAMP"),
     )
 
+    user: Mapped["User"] = relationship(back_populates="bookings")
     space: Mapped["ParkingSpace"] = relationship(back_populates="bookings")
 
     __table_args__ = (
+        Index("ix_bookings_space_status", "space_id", "status"),
+        # A parking space can only ever have one open (Pending/Active) booking.
+        # Enforced by the database so concurrent requests cannot race.
         Index(
-            "ix_bookings_space_status",
+            "uq_bookings_open_space",
             "space_id",
-            "status",
+            unique=True,
+            postgresql_where=text("status IN ('Pending', 'Active')"),
+            sqlite_where=text("status IN ('Pending', 'Active')"),
         ),
     )
 
 
-def get_space_status(space: ParkingSpace) -> tuple[BookingStatus | None, str]:
-    """Return (open_status_or_none, color).
+def status_color(status: BookingStatus | str | None) -> str:
+    """Colour a space is displayed with for a given open-booking status."""
+    if status is None:
+        return AVAILABLE_COLOR
+    if not isinstance(status, BookingStatus):
+        status = BookingStatus(str(status))
+    return STATUS_COLORS.get(status, AVAILABLE_COLOR)
 
-    Pending/Active are open bookings. Completed/Cancelled do not block a space.
+
+def open_booking_for_space(space: ParkingSpace) -> Booking | None:
+    """Return the space's current open booking, preferring an active one.
+
+    Completed and cancelled bookings never hold a space, and one stale
+    historical booking can never mask the current state.
     """
-    open_status: BookingStatus | None = None
+    candidate: Booking | None = None
     for booking in space.bookings:
-        if booking.status in (BookingStatus.PENDING, BookingStatus.ACTIVE):
-            open_status = booking.status
-            break
-    if open_status == BookingStatus.PENDING:
-        color = "yellow"
-    elif open_status == BookingStatus.ACTIVE:
-        color = "red"
-    else:
-        color = "green"
-    return open_status, color
+        if booking.status not in OPEN_BOOKING_STATUSES:
+            continue
+        if booking.status == BookingStatus.ACTIVE:
+            return booking
+        candidate = booking
+    return candidate
+
+
+def get_space_status(space: ParkingSpace) -> tuple[BookingStatus | None, str]:
+    """Return ``(open_status_or_none, color)`` for a parking space.
+
+    Shared by the admin grids, the customer grids and the JSON API so every
+    surface derives the same colour from the same persisted booking data.
+    """
+    booking = open_booking_for_space(space)
+    status = booking.status if booking else None
+    return status, status_color(status)
+
+
+def is_space_available(space: ParkingSpace) -> bool:
+    """True when the space has no open (Pending/Active) booking."""
+    return open_booking_for_space(space) is None
+
+
+def find_open_booking(
+    db: Session, space_id: int, exclude_booking_id: int | None = None
+) -> Booking | None:
+    """Query the single open booking of a space, if any.
+
+    ``exclude_booking_id`` lets an edit ignore the booking being changed.
+    """
+    statement = select(Booking).where(
+        Booking.space_id == space_id,
+        Booking.status.in_(OPEN_BOOKING_STATUSES),
+    )
+    if exclude_booking_id is not None:
+        statement = statement.where(Booking.id != exclude_booking_id)
+    return db.scalars(statement.order_by(Booking.id)).first()
+
+
+def lot_space_count(db: Session, lot_id: int) -> int:
+    """Number of parking spaces already registered for a lot."""
+    existing = db.scalar(
+        select(func.count()).select_from(ParkingSpace).where(
+            ParkingSpace.lot_id == lot_id
+        )
+    )
+    return int(existing) if existing is not None else 0
+
+
+def is_space_available_for_capacity(lot: ParkingLot, db: Session) -> bool:
+    """True when adding one more space to lot would not exceed capacity."""
+    return lot_space_count(db, lot.id) + 1 <= lot.capacity
+
+
+def lock_lot(db: Session, lot_id: int) -> ParkingLot | None:
+    """Load a lot with a row lock so concurrent space creation serialises."""
+    return db.get(ParkingLot, lot_id, with_for_update=True)
+
+
+def lock_space(db: Session, space_id: int) -> ParkingSpace | None:
+    """Load a space with a row lock so concurrent bookings serialise."""
+    return db.get(ParkingSpace, space_id, with_for_update=True)

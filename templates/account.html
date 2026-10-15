@@ -5,6 +5,18 @@
 <div class="form-heading account-heading"><h2>You’re signed in.</h2><p class="form-intro">Welcome back to your workspace.</p></div>
 {% if welcome_message %}<div class="notice notice-success" role="status">{{ welcome_message }}</div>{% endif %}
 <section class="account-summary" aria-label="Account details"><div class="avatar">{{ email[0]|upper }}</div><div><p class="summary-label">SIGNED IN AS</p><p class="account-email">{{ email }}</p></div></section>
-<div class="account-actions"><a class="primary-button action-link" href="/change-password">Change password <span aria-hidden="true">→</span></a><form action="/logout" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="secondary-button" type="submit">Sign out</button></form></div>
+<div class="account-actions"><a class="primary-button action-link" href="{{ workspace_url }}">{{ 'Admin workspace' if role == 'admin' else 'Parking dashboard' }} <span aria-hidden="true">→</span></a><a class="secondary-button" href="/change-password">Change password</a></div>
+{% if role == 'admin' %}
+<div class="section">
+  <h3>Administration</h3>
+  <p class="form-intro"><a class="text-link" href="/admin/parking-lots">Parking lot management</a> &middot; <a class="text-link" href="/admin/bookings">Bookings</a> &middot; <a class="text-link" href="/admin/tickets">Tickets</a></p>
+</div>
+{% else %}
+<div class="section">
+  <h3>Parking</h3>
+  <p class="form-intro"><a class="text-link" href="/dashboard">Browse parking lots</a> &middot; <a class="text-link" href="/dashboard/bookings">My bookings and tickets</a></p>
+</div>
+{% endif %}
+<div class="account-actions"><form action="/logout" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="secondary-button" type="submit">Sign out</button></form></div>
 <div class="security-note"><span class="security-icon" aria-hidden="true">✓</span><p><strong>Your account is protected</strong><br>Password updates end your current session and require you to sign in again.</p></div>
 {% endblock %}

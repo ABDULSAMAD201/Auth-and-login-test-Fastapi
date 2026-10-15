@@ -1,1 +1,78 @@
-\"\"\"\nCreate bookings table.\n\nRevision ID: 0005_create_bookings\nRevises: 0004_create_parking_spaces\nCreate Date: 2026-10-16\n\"\"\"\n\nfrom typing import Sequence, Union\n\nfrom alembic import op\nimport sqlalchemy as sa\n\nrevision: str = \"0005_create_bookings\"\ndown_revision: Union[str, None] = \"0004_create_parking_spaces\"\nbranch_labels: Union[str, Sequence[str], None] = None\ndepends_on: Union[str, Sequence[str], None] = None\n\n\ndef upgrade() -> None:\n    op.create_table(\n        \"bookings\",\n        sa.Column(\"id\", sa.Integer(), primary_key=True, autoincrement=True),\n        sa.Column(\n            \"user_id\",\n            sa.Integer(),\n            sa.ForeignKey(\"users.id\", ondelete=\"CASCADE\"),\n            nullable=False,\n        ),\n        sa.Column(\n            \"space_id\",\n            sa.Integer(),\n            sa.ForeignKey(\"parking_spaces.id\", ondelete=\"CASCADE\"),\n            nullable=False,\n        ),\n        sa.Column(\n            \"start_time\",\n            sa.DateTime(timezone=True),\n            nullable=False,\n        ),\n        sa.Column(\n            \"end_time\",\n            sa.DateTime(timezone=True),\n            nullable=False,\n        ),\n        sa.Column(\n            \"status\",\n            sa.Text(),\n            nullable=False,\n            server_default=sa.text(\"'Pending'\"),\n        ),\n        sa.Column(\n            \"started_at\",\n            sa.DateTime(timezone=True),\n            nullable=True,\n        ),\n        sa.Column(\n            \"ended_at\",\n            sa.DateTime(timezone=True),\n            nullable=True,\n        ),\n        sa.Column(\n            \"created_at\",\n            sa.DateTime(timezone=True),\n            nullable=False,\n            server_default=sa.text(\"CURRENT_TIMESTAMP\"),\n        ),\n    )\n    op.create_index(\n        \"ix_bookings_space_status\",\n        \"bookings\",\n        [\"space_id\", \"status\"],\n    )\n\n\ndef downgrade() -> None:\n    op.drop_index(\"ix_bookings_space_status\", table_name=\"bookings\")\n    op.drop_table(\"bookings\")\n
+"""
+Create bookings table.
+
+Revision ID: 0005_create_bookings
+Revises: 0004_create_parking_spaces
+Create Date: 2026-10-16
+"""
+
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+revision: str = "0005_create_bookings"
+down_revision: Union[str, None] = "0004_create_parking_spaces"
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    op.create_table(
+        "bookings",
+        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
+        sa.Column(
+            "user_id",
+            sa.Text(),
+            sa.ForeignKey("users.email", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column(
+            "space_id",
+            sa.Integer(),
+            sa.ForeignKey("parking_spaces.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column(
+            "start_time",
+            sa.DateTime(timezone=True),
+            nullable=False,
+        ),
+        sa.Column(
+            "end_time",
+            sa.DateTime(timezone=True),
+            nullable=False,
+        ),
+        sa.Column(
+            "status",
+            sa.Text(),
+            nullable=False,
+            server_default=sa.text("'Pending'"),
+        ),
+        sa.Column(
+            "started_at",
+            sa.DateTime(timezone=True),
+            nullable=True,
+        ),
+        sa.Column(
+            "ended_at",
+            sa.DateTime(timezone=True),
+            nullable=True,
+        ),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("CURRENT_TIMESTAMP"),
+        ),
+    )
+    op.create_index(
+        "ix_bookings_space_status",
+        "bookings",
+        ["space_id", "status"],
+    )
+
+
+def downgrade() -> None:
+    op.drop_index("ix_bookings_space_status", table_name="bookings")
+    op.drop_table("bookings")

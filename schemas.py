@@ -1,8 +1,8 @@
 import re
+from datetime import datetime
 from typing import Self
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
-
 
 EMAIL_PATTERN = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
@@ -161,7 +161,9 @@ class UserResponse(BaseModel):
 
 
 class BookingStatusField(BaseModel):
-    value: str
+    """Status value paired with the colour the grid must render."""
+
+    value: str | None = None
     color: str
 
 
@@ -177,6 +179,64 @@ class BookingResponse(BaseModel):
     started_at: datetime | None = None
     ended_at: datetime | None = None
     status_field: BookingStatusField
+
+
+class ParkingSpaceResponse(BaseModel):
+    """A parking space plus its current booking state, used by the live API."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    notes: str | None = None
+    status: str | None = None
+    color: str
+    booking_id: int | None = None
+    status_field: BookingStatusField
+
+
+class ParkingLotSummary(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    location: str
+    capacity: int
+    total_spaces: int
+    available_spaces: int
+
+
+class ParkingLotSpacesResponse(BaseModel):
+    """Response body for ``GET /api/lots/{id}/spaces``."""
+
+    lot: ParkingLotSummary
+    spaces: list[ParkingSpaceResponse]
+
+
+class AdminTicketResponse(BaseModel):
+    """A pending or active booking, as shown on the admin tickets page."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    customer_name: str
+    customer_email: str
+    lot_id: int | None = None
+    lot_name: str = ""
+    space_id: int | None = None
+    space_name: str = ""
+    status: str
+    status_field: BookingStatusField
+    start_time: datetime
+    end_time: datetime
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+
+
+class AdminTicketListResponse(BaseModel):
+    """Response body for ``GET /api/admin/tickets``."""
+
+    tickets: list[AdminTicketResponse]
 
 
 class APIResponse(BaseModel):

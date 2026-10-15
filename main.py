@@ -1,123 +1,71 @@
 import hashlib
 import hmac
 import logging
-import uvicorn
 import os
 import secrets
 import smtplib
 import time
+from collections.abc import Mapping
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import urlencode
 
 import httpx
-from datetime import datetime, timezone
-from sqlalchemy import Integer, select, text, func
-from sqlalchemy.exc import IntegrityError
+import uvicorn
 from authlib.integrations.starlette_client import OAuth
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    HTTPException,
+    Request,
+    Response,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from pydantic import ValidationError
-from sqlalchemy.orm import Session
 from fastapi.staticfiles import StaticFiles
+from pydantic import ValidationError
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, selectinload
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.templating import Jinja2Templates
 
 import database
 from models import (
+    OPEN_BOOKING_STATUSES,
     Booking,
     BookingStatus,
     ParkingLot,
     ParkingSpace,
     User,
+    find_open_booking,
     get_space_status,
-    is_space_available,
     is_space_available_for_capacity,
+    lock_lot,
+    lock_space,
+    lot_space_count,
+    now_utc,
+    open_booking_for_space,
+    status_color,
 )
-
 from schemas import (
     APIResponse,
+    AdminTicketListResponse,
+    AdminTicketResponse,
     BookingResponse,
+    BookingStatusField,
     ChangePassword,
     ForgotPassword,
     Login,
+    ParkingLotSpacesResponse,
+    ParkingLotSummary,
+    ParkingSpaceResponse,
     Register,
     ResetPassword,
     UserResponse,
 )
-from schemas import (
-    APIResponse,
-    ChangePassword,
-    ForgotPassword,
-    Login,
-    Register,
-    ResetPassword,
-    UserResponse,
-)
-
-ALLOWED_ROLES = ("customer", "admin")
-PARKING_LOT_VALIDATOR = staticmethod(lambda value: int(value))
-
-
-def require_admin(user: User) -> User:
-    if user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required.")
-    return user
-
-
-def require_customer(user: User) -> User:
-    if user.role != "customer":
-        raise HTTPException(status_code=403, detail="Customer access required.")
-    return user
-
-
-def is_current_user_admin(request: Request) -> bool:
-    signed = signed_in_user(request)
-    if not signed:
-        return False
-    return signed.role == "admin"
-
-
-def is_valid_parking_lot_capacity(value: str) -> int:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("Capacity is required.")
-    try:
-        capacity = int(value)
-    except ValueError:
-        raise ValueError("Capacity must be a whole number.")
-    if capacity < 1:
-        raise ValueError("Capacity must be a positive number.")
-    return capacity
-
-
-def parse_datetime(value: str) -> datetime:
-    if not isinstance(value, str):
-        raise ValueError("Invalid booking time format.")
-    value = value.strip()
-    if not value:
-        raise ValueError("Invalid booking time format.")
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        raise ValueError("Invalid booking time format.")
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    else:
-        parsed = parsed.astimezone(timezone.utc)
-    return parsed
-
-
-def booking_open_status(status: str) -> bool:
-    return status in ("Pending", "Active")
-
-
-def create_parking_lot_from_form(values: dict[str, str]) -> ParkingLot:
-    return ParkingLot(
-        name=values["name"].strip(),
-        location=values["location"].strip(),
-        capacity=int(values["capacity"]),
-    )
 
 BASE_DIR = Path(__file__).resolve().parent
 APP_ENV = os.getenv("APP_ENV", "development").lower()
@@ -144,16 +92,20 @@ US_STATES = (
 logger = logging.getLogger("signin_auth")
 
 
-# i made this function to hash passwords using scrypt, which is a secure password hashing algorithm. It generates a random salt and uses it to hash the password, 
-# returning a string that includes the algorithm, salt, and hash. This allows for secure storage of passwords in the database.
+# ---------------------------------------------------------------------------
+# Password hashing
+# ---------------------------------------------------------------------------
+# Passwords are hashed with scrypt. A random salt is generated per password and
+# stored alongside the digest, so the stored value carries algorithm, salt and
+# hash.
 def hash_password(password: str) -> str:
     salt = secrets.token_bytes(16)
     digest = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1)
     return f"scrypt${salt.hex()}${digest.hex()}"
 
 
-# rehashes the password and compares it to the stored hash using a constant-time comparison to prevent timing attacks. 
-# It returns True if the password is correct, and False otherwise.
+# Rehashes the password and compares it with the stored hash using a
+# constant-time comparison to avoid leaking information through timing.
 def verify_password(password: str, encoded: str) -> bool:
     try:
         algorithm, salt_hex, digest_hex = encoded.split("$")
@@ -167,6 +119,9 @@ def verify_password(password: str, encoded: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# CSRF helpers
+# ---------------------------------------------------------------------------
 def create_csrf_token(request: Request) -> str:
     token = request.session.get("csrf_token")
     if not token:
@@ -174,12 +129,29 @@ def create_csrf_token(request: Request) -> str:
         request.session["csrf_token"] = token
     return token
 
-#now we are defining a function called csrf_is_valid that checks 
-# if the CSRF token submitted in a form matches the expected token stored in the user's session.
-def csrf_is_valid(request: Request, form: object) -> bool:
+
+def csrf_is_valid(request: Request, form: Mapping[str, object]) -> bool:
     submitted = str(form.get("csrf_token", ""))
     expected = str(request.session.get("csrf_token", ""))
     return bool(expected) and hmac.compare_digest(submitted, expected)
+
+
+CSRF_MESSAGE = "Your session expired. Please try again."
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+def _navigation_user(request: Request):
+    """Signed-in user for the shared navigation bar.
+
+    Unlike :func:`signed_in_user` this never clears a session that simply has
+    no signed-in identity, so anonymous flows (Google registration, password
+    reset) keep their temporary session state.
+    """
+    if not request.session.get("email"):
+        return None
+    return signed_in_user(request)
 
 
 def render(
@@ -190,6 +162,10 @@ def render(
 ) -> HTMLResponse:
     values = context or {}
     values.setdefault("field_errors", {})
+    values.setdefault("form_errors", {})
+    # Exposes the signed-in identity to the shared navigation. Resolved before
+    # the CSRF token so an expired session cannot invalidate the fresh token.
+    values.setdefault("nav_user", _navigation_user(request))
     values["csrf_token"] = create_csrf_token(request)
     values["google_enabled"] = bool(
         os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET")
@@ -203,9 +179,270 @@ def render(
         status_code=status_code,
     )
 
-#this function retrieves a user from the database based on their email address.
-#It connects to the database, executes a query to select the user with the specified email, 
-#and returns the user object. If no user is found, it returns None.
+
+# ---------------------------------------------------------------------------
+# Authorization helpers
+# ---------------------------------------------------------------------------
+def require_admin(user: User) -> User:
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    return user
+
+
+def require_customer(user: User) -> User:
+    if user.role != "customer":
+        raise HTTPException(status_code=403, detail="Customer access required.")
+    return user
+
+
+def is_current_user_admin(request: Request) -> bool:
+    signed = signed_in_user(request)
+    if not signed:
+        return False
+    return signed.role == "admin"
+
+
+def _admin_required_redirect(request: Request) -> RedirectResponse | None:
+    """Guard for admin HTML endpoints.
+
+    Unauthenticated visitors are redirected to the sign-in page; authenticated
+    non-admins get HTTP 403 through :func:`require_admin`.
+    """
+    user = signed_in_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    require_admin(user)
+    return None
+
+
+def _customer_required_redirect(request: Request) -> RedirectResponse | None:
+    """Guard for customer HTML endpoints."""
+    user = signed_in_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    require_customer(user)
+    return None
+
+
+def require_signed_in_user(request: Request) -> User:
+    """Signed-in user for handlers that already ran a ``_*_required_redirect``.
+
+    Those guards have already sent anonymous visitors away, so a missing user
+    here only happens if the session was invalidated between the two lookups.
+    """
+    user = signed_in_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not signed in.")
+    return user
+
+
+def _user_id_for_session(request: Request) -> str:
+    """Identifier of the signed-in account (the users table key)."""
+    return require_signed_in_user(request).email
+
+
+def _require_current_user_booking(request: Request, booking: Booking) -> Booking:
+    """Customers may only touch their own bookings."""
+    user_id = _user_id_for_session(request)
+    if booking.user_id != user_id:
+        raise HTTPException(status_code=403, detail="You do not own this booking.")
+    return booking
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+def is_valid_parking_lot_capacity(value: str) -> int:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Capacity is required.")
+    try:
+        capacity = int(value)
+    except ValueError:
+        raise ValueError("Capacity must be a whole number.")
+    if capacity < 1:
+        raise ValueError("Capacity must be a positive number.")
+    return capacity
+
+
+def parse_datetime(value: str) -> datetime:
+    """Parse a submitted booking timestamp as UTC.
+
+    Consistent timezone policy: every timestamp stored and compared by the
+    application is timezone-aware UTC. Naive input (``datetime-local``) is
+    interpreted as UTC.
+    """
+    if not isinstance(value, str):
+        raise ValueError("Invalid booking time format.")
+    value = value.strip()
+    if not value:
+        raise ValueError("Invalid booking time format.")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError("Invalid booking time format.")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    else:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# Booking / space presentation helpers
+# ---------------------------------------------------------------------------
+def space_view(space: ParkingSpace) -> dict[str, object]:
+    """Serialisable snapshot of a space and its current open booking.
+
+    The colour comes from the shared :func:`models.get_space_status` helper, so
+    the admin grid, the customer grid and the JSON API can never disagree.
+    """
+    booking = open_booking_for_space(space)
+    _, color = get_space_status(space)
+    status = booking.status if booking else None
+    value = status.value if status else None
+    return {
+        "id": space.id,
+        "name": space.name,
+        "notes": space.notes,
+        "status": value,
+        "color": color,
+        "booking_id": booking.id if booking else None,
+        "booking_user_id": booking.user_id if booking else None,
+        "status_field": {"value": value, "color": color},
+    }
+
+
+def load_lot_spaces(db: Session, lot_id: int) -> list[ParkingSpace]:
+    """Spaces of a lot with bookings eagerly loaded (safe after session close)."""
+    return list(
+        db.scalars(
+            select(ParkingSpace)
+            .where(ParkingSpace.lot_id == lot_id)
+            .options(selectinload(ParkingSpace.bookings))
+            .order_by(ParkingSpace.id)
+        ).all()
+    )
+
+
+def lot_space_summary(db: Session, lot: ParkingLot) -> ParkingLotSummary:
+    total = lot_space_count(db, lot.id)
+    available = db.scalar(
+        select(func.count())
+        .select_from(ParkingSpace)
+        .where(
+            ParkingSpace.lot_id == lot.id,
+            ~ParkingSpace.bookings.any(
+                Booking.status.in_(OPEN_BOOKING_STATUSES)
+            ),
+        )
+    )
+    available_count = int(available) if available is not None else 0
+    return ParkingLotSummary(
+        id=lot.id,
+        name=lot.name,
+        location=lot.location,
+        capacity=lot.capacity,
+        total_spaces=total,
+        available_spaces=max(available_count, 0),
+    )
+
+
+def booking_response(booking: Booking) -> BookingResponse:
+    status = BookingStatus(booking.status)
+    lot_id = booking.space.lot_id if booking.space else 0
+    return BookingResponse(
+        id=booking.id,
+        space_id=booking.space_id,
+        lot_id=lot_id,
+        start_time=booking.start_time,
+        end_time=booking.end_time,
+        status=status.value,
+        started_at=booking.started_at,
+        ended_at=booking.ended_at,
+        status_field=BookingStatusField(
+            value=status.value, color=status_color(status)
+        ),
+    )
+
+
+def admin_booking_rows(bookings: list[Booking]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for booking in bookings:
+        user = booking.user
+        space = booking.space
+        lot = space.lot if space else None
+        status = BookingStatus(booking.status)
+        rows.append(
+            {
+                "id": booking.id,
+                "customer_name": (user.full_name if user else None)
+                or (user.email if user else "Unknown customer"),
+                "customer_email": user.email if user else "",
+                "customer_phone": (user.phone if user else "") or "",
+                "lot_id": lot.id if lot else None,
+                "lot_name": lot.name if lot else "",
+                "space_id": space.id if space else None,
+                "space_name": space.name if space else "",
+                "start_time": booking.start_time,
+                "end_time": booking.end_time,
+                "started_at": booking.started_at,
+                "ended_at": booking.ended_at,
+                "status": status.value,
+                "color": status_color(status),
+                "is_open": status in OPEN_BOOKING_STATUSES,
+            }
+        )
+    return rows
+
+
+def admin_ticket_rows(bookings: list[Booking]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for booking in bookings:
+        user = booking.user
+        space = booking.space
+        lot = space.lot if space else None
+        status = BookingStatus(booking.status)
+        rows.append(
+            {
+                "id": booking.id,
+                "customer_name": (user.full_name if user else None)
+                or (user.email if user else "Unknown customer"),
+                "customer_email": user.email if user else "",
+                "lot_id": lot.id if lot else None,
+                "lot_name": lot.name if lot else "",
+                "space_id": space.id if space else None,
+                "space_name": space.name if space else "",
+                "status": status.value,
+                "status_field": {"value": status.value, "color": status_color(status)},
+                "start_time": booking.start_time,
+                "end_time": booking.end_time,
+                "started_at": booking.started_at,
+                "ended_at": booking.ended_at,
+            }
+        )
+    return rows
+
+
+def space_options(db: Session) -> list[dict[str, object]]:
+    """Every space, labelled with its lot, for the admin booking editor."""
+    spaces = db.scalars(
+        select(ParkingSpace)
+        .options(selectinload(ParkingSpace.lot))
+        .order_by(ParkingSpace.lot_id, ParkingSpace.id)
+    ).all()
+    return [
+        {
+            "id": space.id,
+            "lot_id": space.lot_id,
+            "label": f"{space.lot.name if space.lot else 'Lot'} · {space.name}",
+        }
+        for space in spaces
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Users / sessions
+# ---------------------------------------------------------------------------
 def get_user(email: str) -> User | None:
     with database.SessionLocal() as db:
         return db.get(User, email)
@@ -222,10 +459,7 @@ def validation_messages(error: ValidationError) -> tuple[dict[str, str], str]:
             message = "Field is required."
         elif message.startswith("Value error, "):
             message = message.removeprefix("Value error, ")
-        if (
-            field == "form"
-            and "terms and conditions" in message
-        ):
+        if field == "form" and "terms and conditions" in message:
             field = "terms"
         field_errors[field] = message
         if first_message == "Field is required." or field == "terms":
@@ -234,6 +468,11 @@ def validation_messages(error: ValidationError) -> tuple[dict[str, str], str]:
 
 
 def create_registered_user(db: Session, payload: Register) -> User:
+    """Create an account. Public registration always yields a customer.
+
+    The role is assigned here rather than read from the request, so a crafted
+    payload can never register an administrator.
+    """
     user = User(
         email=payload.email,
         password_hash=hash_password(payload.password),
@@ -241,6 +480,7 @@ def create_registered_user(db: Session, payload: Register) -> User:
         phone=payload.phone,
         state=payload.state,
         terms_accepted_at=int(time.time()),
+        role="customer",
     )
     db.add(user)
     db.commit()
@@ -310,9 +550,7 @@ def reset_user_password(db: Session, payload: ResetPassword) -> bool:
     return True
 
 
-def change_user_password(
-    db: Session, user: User, payload: ChangePassword
-) -> bool:
+def change_user_password(db: Session, user: User, payload: ChangePassword) -> bool:
     if not verify_password(payload.current_password, user.password_hash):
         return False
     user.password_hash = hash_password(payload.password)
@@ -322,10 +560,7 @@ def change_user_password(
     return True
 
 
-#It checks the session for the user's email and expiration time, 
-# and verifies that the session version matches the user's session version in the database. If any of these checks fail, 
-# it clears the session and returns None. Otherwise, it returns the user object.
-def signed_in_user(request: Request):
+def signed_in_user(request: Request) -> User | None:
     email = request.session.get("email")
     expires_at = request.session.get("expires_at", 0)
     if not email or not isinstance(expires_at, int) or expires_at <= int(time.time()):
@@ -348,21 +583,23 @@ def start_session(request: Request, user: User, remember: bool = False) -> None:
     create_csrf_token(request)
 
 
-#sends people to /login .Status code 303 means "See Other",
-#which tells the client to make a GET request to the new URL.
 def redirect_to_login(message: str = "") -> RedirectResponse:
     suffix = f"?{urlencode({'message': message})}" if message else ""
     return RedirectResponse(f"/login{suffix}", status_code=303)
 
 
-#configures reCAPTCHA by checking 
-#if the necessary environment variables for the site key and secret key are set.
+def landing_page_for(user: User) -> str:
+    """Admins land on the admin workspace, customers on their dashboard."""
+    return "/admin" if user.role == "admin" else "/dashboard"
+
+
+# ---------------------------------------------------------------------------
+# CAPTCHA / email
+# ---------------------------------------------------------------------------
 def recaptcha_configured() -> bool:
     return bool(os.getenv("RECAPTCHA_SITE_KEY") and os.getenv("RECAPTCHA_SECRET_KEY"))
 
 
-#asks google to verify the reCAPTCHA token submitted by the user.
-#It sends a POST request to the Google reCAPTCHA API with the secret key, the user's response token, and the user's IP address.
 async def recaptcha_is_valid(token: str, remote_ip: str | None) -> bool:
     if not recaptcha_configured():
         return APP_ENV != "production"
@@ -391,9 +628,6 @@ async def verify_captcha(token: str, remote_ip: str | None) -> bool:
     return bool(result)
 
 
-#emails the link or logs it in development mode. It checks if the SMTP_HOST environment variable is set,
-#and if not, it logs a warning or error message depending on the environment. If the SMTP_HOST is set, 
-# it creates an email message with the reset link and sends it using the SMTP protocol.
 def send_reset_email(email: str, reset_url: str) -> None:
     if not os.getenv("SMTP_HOST"):
         if APP_ENV != "production":
@@ -416,12 +650,9 @@ def send_reset_email(email: str, reset_url: str) -> None:
         smtp.send_message(message)
 
 
-
-
-
-#session middleware makes request.session work with cookie signed secret key.
-#It also sets the session cookie name, max age, same site policy, 
-#and whether it should be sent over HTTPS only in production.
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
 app = FastAPI(title="Sign-In Portal")
 
 
@@ -456,7 +687,6 @@ app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
 
-#OAuth registration sets up google. Security headers adds browser protections.
 oauth = OAuth()
 if os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET"):
     oauth.register(
@@ -478,29 +708,21 @@ async def security_headers(request: Request, call_next):
     return response
 
 
+# ---------------------------------------------------------------------------
+# Account landing page
+# ---------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse, summary="Show the signed-in account page")
 async def home(request: Request):
     user = signed_in_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
-    if user.role == "admin":
-        return render(
-            request,
-            "account.html",
-            {
-                "email": user.email,
-                "welcome_message": (
-                    f"Welcome, {user.full_name}!"
-                    if request.query_params.get("welcome")
-                    else ""
-                ),
-            },
-        )
     return render(
         request,
         "account.html",
         {
             "email": user.email,
+            "role": user.role,
+            "workspace_url": landing_page_for(user),
             "welcome_message": (
                 f"Welcome, {user.full_name}!"
                 if request.query_params.get("welcome")
@@ -510,28 +732,57 @@ async def home(request: Request):
     )
 
 
-@app.get(
-    "/admin",
-    response_class=HTMLResponse,
-    summary="Admin-only dashboard",
-)
+# ---------------------------------------------------------------------------
+# Admin: dashboard, parking lots, spaces
+# ---------------------------------------------------------------------------
+@app.get("/admin", response_class=HTMLResponse, summary="Admin-only dashboard")
 async def admin_page(request: Request):
+    redirect_or_none = _admin_required_redirect(request)
+    if redirect_or_none is not None:
+        return redirect_or_none
     user = signed_in_user(request)
-    if not user:
-        return RedirectResponse("/login", status_code=303)
-    require_admin(user)
-    lots = []
+
     with database.SessionLocal() as db:
-        lots = db.scalars(
-            select(ParkingLot).order_by(ParkingLot.id)
-        ).all()
+        lots = list(db.scalars(select(ParkingLot).order_by(ParkingLot.id)).all())
+        lot_summaries = [lot_space_summary(db, lot) for lot in lots]
+        total_spaces = int(
+            db.scalar(select(func.count()).select_from(ParkingSpace)) or 0
+        )
+        open_bookings = int(
+            db.scalar(
+                select(func.count())
+                .select_from(Booking)
+                .where(Booking.status.in_(OPEN_BOOKING_STATUSES))
+            )
+            or 0
+        )
+        recent_bookings = admin_booking_rows(
+            list(
+                db.scalars(
+                    select(Booking)
+                    .options(
+                        selectinload(Booking.user),
+                        selectinload(Booking.space).selectinload(ParkingSpace.lot),
+                    )
+                    .order_by(Booking.id.desc())
+                    .limit(10)
+                ).all()
+            )
+        )
+
     return render(
         request,
         "admin.html",
         {
-            "email": user.email,
-            "full_name": user.full_name or "",
-            "parking_lots": lots,
+            "email": user.email if user else "",
+            "full_name": (user.full_name or user.email) if user else "",
+            "parking_lots": lot_summaries,
+            "recent_bookings": recent_bookings,
+            "totals": {
+                "lots": len(lot_summaries),
+                "spaces": total_spaces,
+                "open_bookings": open_bookings,
+            },
         },
     )
 
@@ -542,55 +793,134 @@ async def admin_page(request: Request):
     summary="Parking lot management",
 )
 async def parking_lot_page(request: Request):
-    user = signed_in_user(request)
-    if not user:
-        return RedirectResponse("/login", status_code=303)
-    require_admin(user)
-    lots = []
+    redirect_or_none = _admin_required_redirect(request)
+    if redirect_or_none is not None:
+        return redirect_or_none
+
     with database.SessionLocal() as db:
-        lots = db.scalars(
-            select(ParkingLot).order_by(ParkingLot.id)
-        ).all()
+        lots = list(db.scalars(select(ParkingLot).order_by(ParkingLot.id)).all())
+        lot_summaries = [lot_space_summary(db, lot) for lot in lots]
+
     return render(
         request,
         "parking_lots.html",
         {
-            "parking_lots": lots,
+            "parking_lots": lot_summaries,
+            "added": request.query_params.get("added"),
         },
+    )
+
+
+# Handlers that can answer with more than one response type (an HTML page, a
+# redirect or JSON) are annotated ``-> Response``; each route's
+# ``response_class`` still documents the success path.
+@app.post(
+    "/admin/parking-lots",
+    response_class=HTMLResponse,
+    summary="Create a parking lot",
+)
+async def create_parking_lot(request: Request) -> Response:
+    redirect_or_none = _admin_required_redirect(request)
+    if redirect_or_none is not None:
+        return redirect_or_none
+
+    form = await request.form()
+    values = {
+        "name": str(form.get("name", "")).strip(),
+        "location": str(form.get("location", "")).strip(),
+        "capacity": str(form.get("capacity", "")).strip(),
+    }
+
+    def invalid_page(errors: dict[str, str], status_code: int = 400) -> HTMLResponse:
+        with database.SessionLocal() as db:
+            lots = list(db.scalars(select(ParkingLot).order_by(ParkingLot.id)).all())
+            lot_summaries = [lot_space_summary(db, lot) for lot in lots]
+        return render(
+            request,
+            "parking_lots.html",
+            {
+                "parking_lots": lot_summaries,
+                "form_values": values,
+                "form_errors": errors,
+            },
+            status_code,
+        )
+
+    if not csrf_is_valid(request, form):
+        return invalid_page({"form": CSRF_MESSAGE}, 403)
+
+    errors: dict[str, str] = {}
+    capacity: int | None = None
+    try:
+        capacity = is_valid_parking_lot_capacity(values["capacity"])
+    except ValueError as error:
+        errors["capacity"] = str(error)
+
+    if not values["name"]:
+        errors["name"] = "Name is required."
+    if not values["location"]:
+        errors["location"] = "Location is required."
+
+    if errors or capacity is None:
+        return invalid_page(errors)
+
+    try:
+        with database.SessionLocal.begin() as db:
+            db.add(
+                ParkingLot(
+                    name=values["name"],
+                    location=values["location"],
+                    capacity=capacity,
+                )
+            )
+    except IntegrityError:
+        return invalid_page({"form": "A parking lot with that name already exists."})
+    except Exception:
+        logger.exception("Unexpected error while creating parking lot")
+        return invalid_page(
+            {"form": "An unexpected error occurred. Please try again."}, 500
+        )
+
+    return RedirectResponse(
+        f"/admin/parking-lots?{urlencode({'added': values['name']})}",
+        status_code=303,
     )
 
 
 @app.get(
     "/admin/parking-lots/{lot_id:int}",
     response_class=HTMLResponse,
-    summary="View a parking lot and its spaces",
+    summary="View a parking lot and manage its spaces",
 )
-async def parking_lot_detail_page(request: Request, lot_id: int) -> HTMLResponse:
-    user = signed_in_user(request)
-    if not user:
-        return RedirectResponse("/login", status_code=303)
-    require_admin(user)
+async def parking_lot_detail_page(request: Request, lot_id: int) -> Response:
+    redirect_or_none = _admin_required_redirect(request)
+    if redirect_or_none is not None:
+        return redirect_or_none
 
     with database.SessionLocal() as db:
         lot = db.get(ParkingLot, lot_id)
         if not lot:
-            return RedirectResponse(
-                "/admin/parking-lots",
-                status_code=303,
-            )
-        spaces = db.scalars(
-            select(ParkingSpace)
-            .where(ParkingSpace.lot_id == lot.id)
-            .order_by(ParkingSpace.id)
-        ).all()
+            return RedirectResponse("/admin/parking-lots", status_code=303)
+        spaces = load_lot_spaces(db, lot.id)
+        views = [space_view(space) for space in spaces]
+        space_total = lot_space_count(db, lot.id)
+        lot_payload = {
+            "id": lot.id,
+            "name": lot.name,
+            "location": lot.location,
+            "capacity": lot.capacity,
+        }
 
     return render(
         request,
         "parking_lot_detail.html",
         {
-            "lot": lot,
-            "spaces": spaces,
-            "get_space_status": get_space_status,
+            "lot": lot_payload,
+            "space_views": views,
+            "space_total": space_total,
+            "added": request.query_params.get("added"),
+            # One-shot confirmation set when a space was just created.
+            "space_notice": request.session.pop("space_notice", None),
         },
     )
 
@@ -600,268 +930,456 @@ async def parking_lot_detail_page(request: Request, lot_id: int) -> HTMLResponse
     response_class=HTMLResponse,
     summary="Add a parking space to a lot",
 )
-async def create_parking_space(request: Request, lot_id: int) -> HTMLResponse:
-    _admin_required_redirect(request)
-
-    _admin_required_redirect(request)
+async def create_parking_space(request: Request, lot_id: int) -> Response:
+    redirect_or_none = _admin_required_redirect(request)
+    if redirect_or_none is not None:
+        return redirect_or_none
 
     form = await request.form()
-    raw_notes = str(form.get("notes", ""))
-    values: dict[str, str] = {
+    values = {
         "name": str(form.get("name", "")).strip(),
-        "notes": raw_notes.strip(),
+        "notes": str(form.get("notes", "")).strip(),
     }
 
-    errors: dict[str, str] = {}
-    if not values["name"]:
-        errors["name"] = "Space name is required."
-
-    if errors:
+    def detail_page(errors: dict[str, str], status_code: int = 400) -> Response:
         with database.SessionLocal() as db:
             lot = db.get(ParkingLot, lot_id)
             if not lot:
-                return RedirectResponse(
-                    "/admin/parking-lots",
-                    status_code=303,
-                )
-            spaces = db.scalars(
-                select(ParkingSpace)
-                .where(ParkingSpace.lot_id == lot.id)
-                .order_by(ParkingSpace.id)
-            ).all()
+                return RedirectResponse("/admin/parking-lots", status_code=303)
+            spaces = load_lot_spaces(db, lot.id)
+            views = [space_view(space) for space in spaces]
+            payload = {
+                "id": lot.id,
+                "name": lot.name,
+                "location": lot.location,
+                "capacity": lot.capacity,
+            }
         return render(
             request,
             "parking_lot_detail.html",
             {
-                "lot": lot,
-                "spaces": spaces,
+                "lot": payload,
+                "space_views": views,
                 "form_values": values,
                 "form_errors": errors,
             },
-            400,
+            status_code,
         )
 
+    if not csrf_is_valid(request, form):
+        return detail_page({"form": CSRF_MESSAGE}, 403)
+
+    if not values["name"]:
+        return detail_page({"name": "Space name is required."})
+
+    duplicate_exists = False
     try:
         with database.SessionLocal.begin() as db:
-            lot = db.get(ParkingLot, lot_id)
+            # Lock the lot so concurrent submissions cannot both pass the
+            # capacity check and overshoot the limit.
+            lot = lock_lot(db, lot_id)
             if not lot:
-                return RedirectResponse(
-                    "/admin/parking-lots",
-                    status_code=303,
-                )
+                return RedirectResponse("/admin/parking-lots", status_code=303)
 
-            if not is_space_available_for_capacity(lot):
-                raise ValueError(
-                    f"Total spaces exceed the defined parking lot capacity of {lot.capacity}"
+            # A space name must be unique inside its own lot. The duplicate is
+            # reported before the capacity limit because it is the more
+            # specific problem.
+            duplicate_exists = (
+                db.scalar(
+                    select(ParkingSpace).where(
+                        ParkingSpace.lot_id == lot.id,
+                        ParkingSpace.name == values["name"],
+                    )
                 )
-
-            space = ParkingSpace(
-                lot_id=lot.id,
-                name=values["name"],
-                notes=values["notes"] or None,
+                is not None
             )
-            db.add(space)
+            if not duplicate_exists:
+                if not is_space_available_for_capacity(lot, db):
+                    raise ValueError(
+                        f"Total spaces exceed the defined parking lot capacity of {lot.capacity}"
+                    )
 
-        return RedirectResponse(
-            f"/admin/parking-lots/{lot.id}?added={values['name']}",
-            status_code=303,
-        )
-
+                db.add(
+                    ParkingSpace(
+                        lot_id=lot.id,
+                        name=values["name"],
+                        notes=values["notes"] or None,
+                    )
+                )
     except ValueError as error:
-        with database.SessionLocal() as db:
-            lot = db.get(ParkingLot, lot_id)
-            if not lot:
-                return RedirectResponse(
-                    "/admin/parking-lots",
-                    status_code=303,
-                )
-            spaces = db.scalars(
-                select(ParkingSpace)
-                .where(ParkingSpace.lot_id == lot.id)
-                .order_by(ParkingSpace.id)
-            ).all()
-        return render(
-            request,
-            "parking_lot_detail.html",
-            {
-                "lot": lot,
-                "spaces": spaces,
-                "form_values": values,
-                "form_errors": {"form": str(error)},
-            },
-            400,
-        )
+        return detail_page({"form": str(error)})
     except IntegrityError:
-        with database.SessionLocal() as db:
-            lot = db.get(ParkingLot, lot_id)
-            if not lot:
-                return RedirectResponse(
-                    "/admin/parking-lots",
-                    status_code=303,
-                )
-            spaces = db.scalars(
-                select(ParkingSpace)
-                .where(ParkingSpace.lot_id == lot.id)
-                .order_by(ParkingSpace.id)
-            ).all()
-        return render(
-            request,
-            "parking_lot_detail.html",
-            {
-                "lot": lot,
-                "spaces": spaces,
-                "form_values": values,
-                "form_errors": {
-                    "name": "A space with that name already exists in this lot.",
-                },
-            },
-            400,
+        return detail_page(
+            {"name": "A space with that name already exists in this lot."}
         )
     except Exception:
         logger.exception("Unexpected error while adding parking space")
-        with database.SessionLocal() as db:
-            lot = db.get(ParkingLot, lot_id)
-            if not lot:
-                return RedirectResponse(
-                    "/admin/parking-lots",
-                    status_code=303,
-                )
-            spaces = db.scalars(
-                select(ParkingSpace)
-                .where(ParkingSpace.lot_id == lot.id)
-                .order_by(ParkingSpace.id)
-            ).all()
-        return render(
-            request,
-            "parking_lot_detail.html",
-            {
-                "lot": lot,
-                "spaces": spaces,
-                "form_values": values,
-                "form_errors": {
-                    "form": "An unexpected error occurred. Please try again.",
-                },
-            },
-            500,
+        return detail_page(
+            {"form": "An unexpected error occurred. Please try again."}, 500
         )
+
+    if duplicate_exists:
+        return detail_page(
+            {"name": "A space with that name already exists in this lot."}
+        )
+
+    request.session["space_notice"] = f"Added {values['name']}."
+    return RedirectResponse(f"/admin/parking-lots/{lot_id}", status_code=303)
+
+
+# ---------------------------------------------------------------------------
+# Admin: booking management
+# ---------------------------------------------------------------------------
+ADMIN_BOOKING_MESSAGES = {
+    "updated": ("success", "Booking updated."),
+    "cancelled": ("success", "Booking cancelled and the space was released."),
+    "conflict": ("error", "That space already has an open booking."),
+    "invalid": ("error", "That change is not allowed for this booking."),
+    "invalid_time": ("error", "End time must be after start time."),
+    "invalid_format": ("error", "Enter valid start and end times."),
+    "space_not_found": ("error", "Select an existing parking space."),
+    "not_found": ("error", "That booking no longer exists."),
+}
+
+
+def _booking_flash(params) -> dict[str, str]:
+    for key, (kind, message) in ADMIN_BOOKING_MESSAGES.items():
+        if params.get(key):
+            return {"kind": kind, "message": message}
+    return {}
+
+
+def _admin_bookings_redirect(*, lot_id: str = "", **flags: str) -> RedirectResponse:
+    params = {key: value for key, value in flags.items() if value}
+    if lot_id:
+        params["lot_id"] = lot_id
+    query = f"?{urlencode(params)}" if params else ""
+    return RedirectResponse(f"/admin/bookings{query}", status_code=303)
 
 
 @app.get(
-    "/dashboard",
+    "/admin/bookings",
     response_class=HTMLResponse,
-    summary="Customer dashboard",
+    summary="Admin-only booking management",
 )
-async def dashboard_page(request: Request):
-    user = signed_in_user(request)
-    if not user:
-        return RedirectResponse("/login", status_code=303)
-    require_customer(user)
-    lots = []
-    with database.SessionLocal() as db:
-        lots = db.scalars(
-            select(ParkingLot).order_by(ParkingLot.id)
-        ).all()
+async def admin_bookings_page(request: Request):
+    redirect_or_none = _admin_required_redirect(request)
+    if redirect_or_none is not None:
+        return redirect_or_none
 
-    lot_summaries: list[dict[str, object]] = []
+    lot_id_filter = request.query_params.get("lot_id", "").strip()
+    selected_lot: int | None = None
+    if lot_id_filter.isdigit():
+        selected_lot = int(lot_id_filter)
+
     with database.SessionLocal() as db:
-        for lot in lots:
-            total_spaces = db.scalar(
-                select(db.func.count()).select_from(ParkingSpace).where(
-                    ParkingSpace.lot_id == lot.id
+        lots = list(db.scalars(select(ParkingLot).order_by(ParkingLot.id)).all())
+        statement = (
+            select(Booking)
+            .options(
+                selectinload(Booking.user),
+                selectinload(Booking.space).selectinload(ParkingSpace.lot),
+            )
+            .order_by(Booking.id.desc())
+        )
+        if selected_lot is not None:
+            statement = statement.join(
+                ParkingSpace, Booking.space_id == ParkingSpace.id
+            ).where(ParkingSpace.lot_id == selected_lot)
+        bookings = list(db.scalars(statement).all())
+        rows = admin_booking_rows(bookings)
+        options = space_options(db)
+
+    return render(
+        request,
+        "admin_bookings.html",
+        {
+            "booking_rows": rows,
+            "lots": [{"id": lot.id, "name": lot.name} for lot in lots],
+            "selected_lot": selected_lot,
+            "space_options": options,
+            "flash": _booking_flash(request.query_params),
+        },
+    )
+
+
+@app.post(
+    "/admin/bookings/{booking_id:int}/cancel",
+    response_class=HTMLResponse,
+    summary="Cancel a booking as an administrator",
+)
+async def admin_cancel_booking(request: Request, booking_id: int) -> Response:
+    redirect_or_none = _admin_required_redirect(request)
+    if redirect_or_none is not None:
+        return redirect_or_none
+
+    form = await request.form()
+    lot_id = str(form.get("lot_id", "")).strip()
+    if not csrf_is_valid(request, form):
+        return _admin_bookings_redirect(lot_id=lot_id, invalid="1")
+
+    try:
+        with database.SessionLocal.begin() as db:
+            booking = db.get(Booking, booking_id)
+            if not booking:
+                return _admin_bookings_redirect(lot_id=lot_id, not_found="1")
+            # Completed and cancelled bookings cannot transition again.
+            if BookingStatus(booking.status) not in OPEN_BOOKING_STATUSES:
+                return _admin_bookings_redirect(lot_id=lot_id, invalid="1")
+            booking.status = BookingStatus.CANCELLED
+    except Exception:
+        logger.exception("Unexpected error while cancelling booking as admin")
+        return _admin_bookings_redirect(lot_id=lot_id, invalid="1")
+
+    return _admin_bookings_redirect(lot_id=lot_id, cancelled="1")
+
+
+@app.post(
+    "/admin/bookings/{booking_id:int}/update",
+    response_class=HTMLResponse,
+    summary="Modify a booking's space or times as an administrator",
+)
+async def admin_update_booking(request: Request, booking_id: int) -> Response:
+    redirect_or_none = _admin_required_redirect(request)
+    if redirect_or_none is not None:
+        return redirect_or_none
+
+    form = await request.form()
+    lot_filter = str(form.get("lot_id", "")).strip()
+    space_field = str(form.get("space_id", "")).strip()
+    if not csrf_is_valid(request, form):
+        return _admin_bookings_redirect(lot_id=lot_filter, invalid="1")
+
+    if not space_field.isdigit():
+        return _admin_bookings_redirect(lot_id=lot_filter, space_not_found="1")
+
+    try:
+        start_time = parse_datetime(str(form.get("start_time", "")))
+        end_time = parse_datetime(str(form.get("end_time", "")))
+    except ValueError:
+        return _admin_bookings_redirect(lot_id=lot_filter, invalid_format="1")
+
+    if end_time <= start_time:
+        return _admin_bookings_redirect(lot_id=lot_filter, invalid_time="1")
+
+    target_space_id = int(space_field)
+
+    try:
+        with database.SessionLocal.begin() as db:
+            booking = db.get(Booking, booking_id)
+            if not booking:
+                return _admin_bookings_redirect(lot_id=lot_filter, not_found="1")
+            if BookingStatus(booking.status) not in OPEN_BOOKING_STATUSES:
+                return _admin_bookings_redirect(lot_id=lot_filter, invalid="1")
+
+            # Lock the destination space so two concurrent edits cannot both
+            # see it as free.
+            space = lock_space(db, target_space_id)
+            if not space:
+                return _admin_bookings_redirect(
+                    lot_id=lot_filter, space_not_found="1"
                 )
+
+            conflict = find_open_booking(db, space.id, exclude_booking_id=booking.id)
+            if conflict is not None:
+                return _admin_bookings_redirect(lot_id=lot_filter, conflict="1")
+
+            booking.space_id = space.id
+            booking.start_time = start_time
+            booking.end_time = end_time
+    except IntegrityError:
+        return _admin_bookings_redirect(lot_id=lot_filter, conflict="1")
+    except Exception:
+        logger.exception("Unexpected error while updating booking as admin")
+        return _admin_bookings_redirect(lot_id=lot_filter, invalid="1")
+
+    return _admin_bookings_redirect(lot_id=lot_filter, updated="1")
+
+
+def load_open_bookings(db: Session) -> list[Booking]:
+    """Pending and Active bookings, oldest first."""
+    return list(
+        db.scalars(
+            select(Booking)
+            .where(Booking.status.in_(OPEN_BOOKING_STATUSES))
+            .options(
+                selectinload(Booking.user),
+                selectinload(Booking.space).selectinload(ParkingSpace.lot),
             )
-            total_spaces = int(total_spaces) if total_spaces is not None else 0
-            available = db.scalar(
-                select(db.func.count()).select_from(ParkingSpace).where(
-                    ParkingSpace.lot_id == lot.id,
-                    ~ParkingSpace.bookings.any(
-                        Booking.status.in_(["Pending", "Active"])
-                    ),
-                )
-            )
-            available = int(available) if available is not None else 0
-            if available < 0:
-                available = 0
-            lot_summaries.append(
-                {
-                    "id": lot.id,
-                    "name": lot.name,
-                    "location": lot.location,
-                    "total_spaces": total_spaces,
-                    "available_spaces": available,
-                }
-            )
+            .order_by(Booking.id)
+        ).all()
+    )
+
+
+@app.get(
+    "/admin/tickets",
+    response_class=HTMLResponse,
+    summary="Admin-only view of pending and active tickets",
+)
+async def admin_tickets_page(request: Request):
+    redirect_or_none = _admin_required_redirect(request)
+    if redirect_or_none is not None:
+        return redirect_or_none
+
+    with database.SessionLocal() as db:
+        rows = admin_ticket_rows(load_open_bookings(db))
+
+    return render(request, "admin_tickets.html", {"ticket_rows": rows})
+
+
+# ---------------------------------------------------------------------------
+# Customer: dashboard, lots, bookings
+# ---------------------------------------------------------------------------
+@app.get("/dashboard", response_class=HTMLResponse, summary="Customer dashboard")
+async def dashboard_page(request: Request):
+    redirect_or_none = _customer_required_redirect(request)
+    if redirect_or_none is not None:
+        return redirect_or_none
+    user = require_signed_in_user(request)
+
+    with database.SessionLocal() as db:
+        lots = list(db.scalars(select(ParkingLot).order_by(ParkingLot.id)).all())
+        lot_summaries = [lot_space_summary(db, lot) for lot in lots]
+        my_bookings = list(
+            db.scalars(
+                select(Booking)
+                .where(Booking.user_id == user.email)
+                .options(selectinload(Booking.space).selectinload(ParkingSpace.lot))
+                .order_by(Booking.id.desc())
+            ).all()
+        )
 
     return render(
         request,
         "dashboard.html",
         {
             "email": user.email,
+            "lots": lot_summaries,
+            "open_tickets": admin_booking_rows(
+                [
+                    booking
+                    for booking in my_bookings
+                    if BookingStatus(booking.status) in OPEN_BOOKING_STATUSES
+                ]
+            ),
             "welcome_message": (
                 f"Welcome, {user.full_name}!"
                 if request.query_params.get("welcome")
                 else ""
             ),
-            "lots": lot_summaries,
         },
     )
 
 
-def _user_id_for_session(request: Request) -> int:
-    user = signed_in_user(request)
-    if not user:
-        raise HTTPException(status_code=401, detail="Not signed in.")
-    return user.id
-
-
-def _require_current_user_booking(request: Request, booking: Booking) -> Booking:
-    user_id = _user_id_for_session(request)
-    if booking.user_id != user_id:
-        raise HTTPException(status_code=403, detail="You do not own this booking.")
-    return booking
-
-
-
 @app.get(
-    "/dashboard/lots/{lot_id:int}/spaces/{space_id:int}/new",
+    "/dashboard/lots/{lot_id:int}",
     response_class=HTMLResponse,
-    summary="Prepare a booking request for an available space",
+    summary="Customer view of a parking lot's spaces",
 )
-async def customer_space_new_page(request: Request, lot_id: int, space_id: int) -> HTMLResponse:
-    user = signed_in_user(request)
-    if not user:
-        return RedirectResponse("/login", status_code=303)
-    require_customer(user)
+async def customer_lot_page(request: Request, lot_id: int) -> Response:
+    redirect_or_none = _customer_required_redirect(request)
+    if redirect_or_none is not None:
+        return redirect_or_none
+    user = require_signed_in_user(request)
 
     with database.SessionLocal() as db:
         lot = db.get(ParkingLot, lot_id)
         if not lot:
-            return RedirectResponse(
-                "/dashboard",
-                status_code=303,
-            )
-        space = db.get(ParkingSpace, space_id)
-        if not space or space.lot_id != lot.id:
-            return RedirectResponse(
-                "/dashboard",
-                status_code=303,
-            )
-        open_status, color = get_space_status(space)
-        if open_status is not None:
-            return RedirectResponse(
-                f"/dashboard/lots/{lot_id}/spaces/{space_id}",
-                status_code=303,
-            )
+            return RedirectResponse("/dashboard", status_code=303)
+        spaces = load_lot_spaces(db, lot.id)
+        views = [space_view(space) for space in spaces]
+        summary = lot_space_summary(db, lot)
 
     return render(
         request,
-        "customer_space_new.html",
-        {
-            "lot": lot,
-            "space": space,
-            "csrf_token": create_csrf_token(request),
-        },
+        "lot_spaces.html",
+        {"lot": summary, "space_views": views, "user_id": user.email},
     )
+
+
+@app.get(
+    "/dashboard/bookings",
+    response_class=HTMLResponse,
+    summary="Customer bookings and tickets",
+)
+async def customer_bookings_page(request: Request) -> Response:
+    redirect_or_none = _customer_required_redirect(request)
+    if redirect_or_none is not None:
+        return redirect_or_none
+    user = require_signed_in_user(request)
+
+    with database.SessionLocal() as db:
+        bookings = list(
+            db.scalars(
+                select(Booking)
+                .where(Booking.user_id == user.email)
+                .options(selectinload(Booking.space).selectinload(ParkingSpace.lot))
+                .order_by(Booking.id.desc())
+            ).all()
+        )
+        rows = admin_booking_rows(bookings)
+
+    return render(
+        request,
+        "customer_bookings.html",
+        {"booking_rows": rows, "flash": _customer_flash(request)},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Customer: booking actions
+# ---------------------------------------------------------------------------
+BOOKING_REDIRECT_TARGETS = {"space", "bookings"}
+
+CUSTOMER_BOOKING_MESSAGES = {
+    "created": ("success", "Ticket generated. The space is now reserved for you."),
+    "started": ("success", "Ticket started. You are now using this space."),
+    "ended": ("success", "Ticket ended and the booking is now completed."),
+    "cancelled": ("success", "Booking cancelled. This space is available again."),
+    "conflict": ("error", "This space already has an open booking."),
+    "invalid": ("error", "That action is not allowed for this booking."),
+    "forbidden": ("error", "You do not have permission to do that."),
+    "not_found": ("error", "That booking was not found."),
+    "expired": ("error", CSRF_MESSAGE),
+}
+
+
+def _customer_flash(request: Request) -> dict[str, str]:
+    """Translate the action flags on the query string into a user message."""
+    for key, (kind, text) in CUSTOMER_BOOKING_MESSAGES.items():
+        if request.query_params.get(key):
+            return {"kind": kind, "message": text}
+    return {}
+
+
+def _booking_action_redirect(
+    lot_id: int, space_id: int, flag: str, target: str
+) -> RedirectResponse:
+    """Send the customer back where they came from (allow-listed targets)."""
+    if target == "bookings":
+        return RedirectResponse(
+            f"/dashboard/bookings?{urlencode({flag: '1'})}", status_code=303
+        )
+    return RedirectResponse(
+        f"/dashboard/lots/{lot_id}/spaces/{space_id}?{urlencode({flag: '1'})}",
+        status_code=303,
+    )
+
+
+def _booking_action_context(
+    db: Session, lot_id: int, space_id: int
+) -> dict[str, object]:
+    lot = db.get(ParkingLot, lot_id)
+    space = db.get(ParkingSpace, space_id)
+    if not lot or not space or space.lot_id != lot.id:
+        return {}
+    return {
+        "lot": lot_space_summary(db, lot),
+        "space": space_view(space),
+        "bookings": [],
+        "user_id": None,
+        "flash": {},
+    }
 
 
 @app.get(
@@ -869,74 +1387,371 @@ async def customer_space_new_page(request: Request, lot_id: int, space_id: int) 
     response_class=HTMLResponse,
     summary="Customer space detail and ticket actions",
 )
-async def customer_space_page(request: Request, lot_id: int, space_id: int) -> HTMLResponse:
-    user = signed_in_user(request)
-    if not user:
-        return RedirectResponse("/login", status_code=303)
-    require_customer(user)
+async def customer_space_page(
+    request: Request, lot_id: int, space_id: int
+) -> Response:
+    redirect_or_none = _customer_required_redirect(request)
+    if redirect_or_none is not None:
+        return redirect_or_none
+    user = require_signed_in_user(request)
 
     with database.SessionLocal() as db:
         lot = db.get(ParkingLot, lot_id)
         if not lot:
-            return RedirectResponse(
-                "/dashboard",
-                status_code=303,
-            )
+            return RedirectResponse("/dashboard", status_code=303)
         space = db.get(ParkingSpace, space_id)
         if not space or space.lot_id != lot.id:
-            return RedirectResponse(
-                "/dashboard",
-                status_code=303,
-            )
-        bookings = db.scalars(
-            select(Booking)
-            .where(Booking.space_id == space.id)
-            .order_by(Booking.id)
-        ).all()
-        open_status, color = get_space_status(space)
-        form_values: dict[str, str] = {}
-        form_errors: dict[str, str] = {}
-        message: str | None = None
-        if request.query_params.get("created"):
-            message = "Ticket generated. The space is now reserved for you."
-        elif request.query_params.get("started"):
-            message = "Ticket started. You are now using this space."
-        elif request.query_params.get("ended"):
-            message = "Ticket ended and the booking is now completed."
-        elif request.query_params.get("cancelled"):
-            message = "Booking cancelled. This space is available again."
-        elif request.query_params.get("conflict"):
-            form_errors["form"] = "This space already has an open booking."
-        elif request.query_params.get("invalid"):
-            form_errors["form"] = "Could not complete that action."
-        elif request.query_params.get("forbidden"):
-            form_errors["form"] = "You do not have permission to do that."
-        elif request.query_params.get("not_found"):
-            form_errors["form"] = "That booking was not found."
+            return RedirectResponse("/dashboard", status_code=303)
+        bookings = list(
+            db.scalars(
+                select(Booking)
+                .where(Booking.space_id == space.id)
+                .order_by(Booking.id)
+            ).all()
+        )
+        view = space_view(space)
+        lot_summary = lot_space_summary(db, lot)
 
-    active_booking = None
-    if open_status == BookingStatus.ACTIVE:
-        for booking in bookings:
-            if booking.status == BookingStatus.ACTIVE:
-                active_booking = booking
-                break
+    # Customers only ever see their own bookings for the space; other people's
+    # booking rows are never exposed.
+    my_bookings = [booking for booking in bookings if booking.user_id == user.email]
+    active_booking = next(
+        (
+            booking
+            for booking in my_bookings
+            if BookingStatus(booking.status) == BookingStatus.ACTIVE
+        ),
+        None,
+    )
 
     return render(
         request,
         "customer_space.html",
         {
-            "lot": lot,
-            "space": space,
-            "get_space_status": get_space_status,
-            "status": open_status,
-            "color": color,
-            "bookings": bookings,
-            "user_id": user.id,
-            "form_values": form_values,
-            "form_errors": form_errors,
-            "message": message,
+            "lot": lot_summary,
+            "space": view,
+            "my_bookings": my_bookings,
             "active_booking": active_booking,
+            "user_id": user.email,
+            "flash": _customer_flash(request),
         },
+    )
+
+
+@app.get(
+    "/dashboard/lots/{lot_id:int}/spaces/{space_id:int}/new",
+    response_class=HTMLResponse,
+    summary="Prepare a booking request for an available space",
+)
+async def customer_space_new_page(
+    request: Request, lot_id: int, space_id: int
+) -> Response:
+    redirect_or_none = _customer_required_redirect(request)
+    if redirect_or_none is not None:
+        return redirect_or_none
+
+    with database.SessionLocal() as db:
+        lot = db.get(ParkingLot, lot_id)
+        if not lot:
+            return RedirectResponse("/dashboard", status_code=303)
+        space = db.get(ParkingSpace, space_id)
+        if not space or space.lot_id != lot.id:
+            return RedirectResponse("/dashboard", status_code=303)
+        view = space_view(space)
+        if view["status"] is not None:
+            return RedirectResponse(
+                f"/dashboard/lots/{lot_id}/spaces/{space_id}", status_code=303
+            )
+        lot_summary = lot_space_summary(db, lot)
+
+    return render(
+        request,
+        "customer_space_new.html",
+        {"lot": lot_summary, "space": view, "form_values": {}, "form_errors": {}},
+    )
+
+
+@app.post(
+    "/dashboard/lots/{lot_id:int}/spaces/{space_id:int}/book",
+    response_class=HTMLResponse,
+    summary="Create a pending booking for a space",
+)
+async def create_booking(request: Request, lot_id: int, space_id: int) -> Response:
+    redirect_or_none = _customer_required_redirect(request)
+    if redirect_or_none is not None:
+        return redirect_or_none
+    user = require_signed_in_user(request)
+
+    form = await request.form()
+    wants_json = (
+        request.headers.get("x-requested-with", "") == "XMLHttpRequest"
+        or request.headers.get("accept", "").startswith("application/json")
+    )
+    values = {
+        "start_time": str(form.get("start_time", "")),
+        "end_time": str(form.get("end_time", "")),
+    }
+
+    def validation_errors() -> dict[str, str]:
+        errors: dict[str, str] = {}
+        try:
+            start = parse_datetime(values["start_time"])
+        except ValueError as error:
+            errors["start_time"] = str(error)
+            start = None
+        try:
+            end = parse_datetime(values["end_time"])
+        except ValueError as error:
+            errors["end_time"] = str(error)
+            end = None
+        if start and end and end <= start:
+            errors["end_time"] = "End time must be after start time."
+        return errors
+
+    if not csrf_is_valid(request, form):
+        if wants_json:
+            return JSONResponse(status_code=403, content={"detail": CSRF_MESSAGE})
+        return _booking_action_redirect(lot_id, space_id, "expired", "space")
+
+    errors = validation_errors()
+    if errors:
+        if wants_json:
+            return JSONResponse(status_code=400, content={"detail": errors})
+        with database.SessionLocal() as db:
+            context = _booking_action_context(db, lot_id, space_id)
+        return render(
+            request,
+            "customer_space_new.html",
+            {**context, "form_values": values, "form_errors": errors},
+            400,
+        )
+
+    start_time = parse_datetime(values["start_time"])
+    end_time = parse_datetime(values["end_time"])
+
+    try:
+        with database.SessionLocal.begin() as db:
+            # Lock the space: a space can only ever hold one open booking.
+            space = lock_space(db, space_id)
+            if not space or space.lot_id != lot_id:
+                if wants_json:
+                    return JSONResponse(
+                        status_code=404, content={"detail": "Space not found."}
+                    )
+                return _booking_action_redirect(
+                    lot_id, space_id, "not_found", "space"
+                )
+
+            if find_open_booking(db, space.id) is not None:
+                if wants_json:
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "detail": "This space already has an open booking."
+                        },
+                    )
+                return _booking_action_redirect(
+                    lot_id, space_id, "conflict", "space"
+                )
+
+            booking = Booking(
+                # Ownership comes from the session, never from the request.
+                user_id=user.email,
+                space_id=space.id,
+                start_time=start_time,
+                end_time=end_time,
+                status=BookingStatus.PENDING,
+            )
+            db.add(booking)
+            db.flush()
+            payload = booking_response(booking)
+
+        if wants_json:
+            return JSONResponse(
+                status_code=201,
+                content={
+                    "detail": "Ticket generated. The space is now reserved for you.",
+                    "booking": payload.model_dump(mode="json"),
+                },
+            )
+        return _booking_action_redirect(lot_id, space_id, "created", "space")
+    except IntegrityError:
+        if wants_json:
+            return JSONResponse(
+                status_code=409,
+                content={"detail": "This space already has an open booking."},
+            )
+        return _booking_action_redirect(lot_id, space_id, "conflict", "space")
+    except Exception:
+        logger.exception("Unexpected error while creating booking")
+        if wants_json:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "An unexpected error occurred. Please try again."},
+            )
+        return _booking_action_redirect(lot_id, space_id, "invalid", "space")
+
+
+async def _booking_transition(
+    request: Request,
+    lot_id: int,
+    space_id: int,
+    *,
+    expected: BookingStatus,
+    new_status: BookingStatus,
+    flag: str,
+    stamp: str | None,
+) -> Response:
+    """Shared implementation for the start/end/cancel ticket actions."""
+    redirect_or_none = _customer_required_redirect(request)
+    if redirect_or_none is not None:
+        return redirect_or_none
+
+    form = await request.form()
+    target = str(form.get("redirect_to", "space"))
+    if target not in BOOKING_REDIRECT_TARGETS:
+        target = "space"
+
+    if not csrf_is_valid(request, form):
+        return _booking_action_redirect(lot_id, space_id, "expired", target)
+
+    booking_field = str(form.get("booking_id", "")).strip()
+    if not booking_field.isdigit():
+        return _booking_action_redirect(lot_id, space_id, "invalid", target)
+    booking_id = int(booking_field)
+
+    redirect_lot_id = lot_id
+    redirect_space_id = space_id
+    try:
+        with database.SessionLocal.begin() as db:
+            booking = db.get(Booking, booking_id)
+            if not booking or booking.space_id != space_id:
+                return _booking_action_redirect(
+                    lot_id, space_id, "not_found", target
+                )
+            _require_current_user_booking(request, booking)
+            redirect_lot_id = booking.space.lot_id if booking.space else lot_id
+            if BookingStatus(booking.status) != expected:
+                return _booking_action_redirect(lot_id, space_id, "invalid", target)
+            booking.status = new_status
+            if stamp == "started_at":
+                booking.started_at = now_utc()
+            elif stamp == "ended_at":
+                booking.ended_at = now_utc()
+    except HTTPException as error:
+        if error.status_code == 403:
+            return _booking_action_redirect(lot_id, space_id, "forbidden", target)
+        raise
+    except Exception:
+        logger.exception("Unexpected error while updating booking")
+        return _booking_action_redirect(lot_id, space_id, "invalid", target)
+
+    return _booking_action_redirect(
+        redirect_lot_id, redirect_space_id, flag, target
+    )
+
+
+@app.post(
+    "/dashboard/lots/{lot_id:int}/spaces/{space_id:int}/start",
+    response_class=HTMLResponse,
+    summary="Start a pending ticket",
+)
+async def start_booking(request: Request, lot_id: int, space_id: int) -> Response:
+    return await _booking_transition(
+        request,
+        lot_id,
+        space_id,
+        expected=BookingStatus.PENDING,
+        new_status=BookingStatus.ACTIVE,
+        flag="started",
+        stamp="started_at",
+    )
+
+
+@app.post(
+    "/dashboard/lots/{lot_id:int}/spaces/{space_id:int}/end",
+    response_class=HTMLResponse,
+    summary="End an active ticket",
+)
+async def end_booking(request: Request, lot_id: int, space_id: int) -> Response:
+    return await _booking_transition(
+        request,
+        lot_id,
+        space_id,
+        expected=BookingStatus.ACTIVE,
+        new_status=BookingStatus.COMPLETED,
+        flag="ended",
+        stamp="ended_at",
+    )
+
+
+@app.post(
+    "/dashboard/lots/{lot_id:int}/spaces/{space_id:int}/cancel",
+    response_class=HTMLResponse,
+    summary="Cancel a pending booking",
+)
+async def cancel_booking(request: Request, lot_id: int, space_id: int) -> Response:
+    return await _booking_transition(
+        request,
+        lot_id,
+        space_id,
+        expected=BookingStatus.PENDING,
+        new_status=BookingStatus.CANCELLED,
+        flag="cancelled",
+        stamp=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# JSON API
+# ---------------------------------------------------------------------------
+@app.get(
+    "/api/lots/{lot_id:int}/spaces",
+    response_model=ParkingLotSpacesResponse,
+    summary="Current status of every space in a parking lot",
+)
+def api_lot_spaces(
+    lot_id: int, request: Request, db: Session = Depends(database.get_db)
+):
+    """Live space statuses, calculated from persisted bookings.
+
+    Any signed-in user may read customer-facing lot data; anonymous callers
+    receive HTTP 401.
+    """
+    if not signed_in_user(request):
+        return JSONResponse(status_code=401, content={"detail": "Not signed in."})
+
+    lot = db.get(ParkingLot, lot_id)
+    if not lot:
+        return JSONResponse(
+            status_code=404, content={"detail": "Parking lot not found."}
+        )
+
+    spaces = load_lot_spaces(db, lot.id)
+    return ParkingLotSpacesResponse(
+        lot=lot_space_summary(db, lot),
+        spaces=[
+            ParkingSpaceResponse.model_validate(space_view(space))
+            for space in spaces
+        ],
+    )
+
+
+@app.get(
+    "/api/admin/tickets",
+    response_model=AdminTicketListResponse,
+    summary="Open tickets (Pending and Active bookings)",
+)
+def api_admin_tickets(request: Request, db: Session = Depends(database.get_db)):
+    user = signed_in_user(request)
+    if not user:
+        return JSONResponse(status_code=401, content={"detail": "Not signed in."})
+    require_admin(user)
+    return AdminTicketListResponse(
+        tickets=[
+            AdminTicketResponse.model_validate(row)
+            for row in admin_ticket_rows(load_open_bookings(db))
+        ]
     )
 
 
@@ -961,7 +1776,9 @@ def api_current_user(request: Request, db: Session = Depends(database.get_db)):
     status_code=201,
     summary="Create an account",
 )
-def api_register(payload: Register, request: Request, db: Session = Depends(database.get_db)):
+def api_register(
+    payload: Register, request: Request, db: Session = Depends(database.get_db)
+):
     google_registration = request.session.get("google_registration", {})
     if google_registration.get("email"):
         payload = payload.model_copy(
@@ -975,7 +1792,6 @@ def api_register(payload: Register, request: Request, db: Session = Depends(data
         return JSONResponse(
             status_code=422, content={"detail": "Select a valid state."}
         )
-    payload = payload.model_copy(update={"role": "customer"})
     try:
         user = create_registered_user(db, payload)
     except IntegrityError:
@@ -985,7 +1801,11 @@ def api_register(payload: Register, request: Request, db: Session = Depends(data
             content={"detail": "An account with this email already exists."},
         )
     start_session(request, user)
-    return APIResponse(message=f"Welcome, {user.full_name}!", user=user)
+    return APIResponse(
+        message=f"Welcome, {user.full_name}!",
+        user=UserResponse.model_validate(user),
+        redirect_to="/dashboard",
+    )
 
 
 @app.post(
@@ -1009,20 +1829,19 @@ async def api_login(
         return JSONResponse(
             status_code=401,
             content={
-                "detail": (
-                    "Verification failed. Please complete the CAPTCHA to proceed."
-                )
+                "detail": "Verification failed. Please complete the CAPTCHA to proceed."
             },
         )
-    user, error, status_code = authenticate_user(
-        db, payload.email, payload.password
-    )
+    user, error, status_code = authenticate_user(db, payload.email, payload.password)
     if error:
         return JSONResponse(status_code=status_code, content={"detail": error})
     assert user is not None
     start_session(request, user, remember=payload.remember)
-    return APIResponse(message="Sign in successful.", user=user)
-
+    return APIResponse(
+        message="Sign in successful.",
+        user=UserResponse.model_validate(user),
+        redirect_to=landing_page_for(user),
+    )
 
 
 @app.post(
@@ -1047,7 +1866,9 @@ def api_forgot_password(
                 f"{base_url}/reset-password?token={token}",
             )
         else:
-            logger.error("PUBLIC_BASE_URL must be configured to send password reset links")
+            logger.error(
+                "PUBLIC_BASE_URL must be configured to send password reset links"
+            )
     return APIResponse(
         message="If an account matches that email, password reset instructions are on their way."
     )
@@ -1062,327 +1883,9 @@ def api_reset_password(payload: ResetPassword, db: Session = Depends(database.ge
     if not reset_user_password(db, payload):
         return JSONResponse(
             status_code=400,
-            content={
-                "detail": "This reset link is invalid or has expired."
-            },
+            content={"detail": "This reset link is invalid or has expired."},
         )
     return APIResponse(message="Password updated. Sign in with your new password.")
-
-
-@app.post(
-    "/dashboard/lots/{lot_id:int}/spaces/{space_id:int}/book",
-    response_class=HTMLResponse,
-    summary="Create a pending booking for a space",
-)
-async def create_booking(request: Request, lot_id: int, space_id: int) -> HTMLResponse:
-    user = signed_in_user(request)
-    if not user:
-        return RedirectResponse("/login", status_code=303)
-    require_customer(user)
-
-    form = await request.form()
-    values: dict[str, object] = {
-        "start_time": str(form.get("start_time", "")),
-        "end_time": str(form.get("end_time", "")),
-    }
-    errors: dict[str, str] = {}
-
-    try:
-        start_time = parse_datetime(values["start_time"])
-    except ValueError as error:
-        errors["start_time"] = str(error)
-
-    try:
-        end_time = parse_datetime(values["end_time"])
-    except ValueError as error:
-        errors["end_time"] = str(error)
-
-    if not errors:
-        if end_time <= start_time:
-            errors["end_time"] = "End time must be after start time."
-
-    if errors:
-        with database.SessionLocal() as db:
-            space = db.get(ParkingSpace, space_id)
-            lot = space.lot if space else None
-            bookings = []
-            if space:
-                bookings = db.scalars(
-                    select(Booking)
-                    .where(Booking.space_id == space.id)
-                    .order_by(Booking.id)
-                ).all()
-        return render(
-            request,
-            "customer_space.html",
-            {
-                "lot": lot,
-                "space": space,
-                "get_space_status": get_space_status,
-                "status": get_space_status(space)[0] if space else None,
-                "color": get_space_status(space)[1] if space else "green",
-                "bookings": bookings,
-                "user_id": user.id,
-                "form_values": values,
-                "form_errors": errors,
-                "message": None,
-            },
-            400,
-        )
-
-    try:
-        with database.SessionLocal.begin() as db:
-            space = db.get(ParkingSpace, space_id)
-            if not space:
-                return RedirectResponse(
-                    "/dashboard",
-                    status_code=303,
-                )
-            open_status, _ = get_space_status(space)
-            if open_status is not None:
-                raise ValueError("This space already has an open booking.")
-
-            booking = Booking(
-                user_id=user.id,
-                space_id=space.id,
-                start_time=start_time,
-                end_time=end_time,
-                status=BookingStatus.PENDING,
-            )
-            db.add(booking)
-
-        return RedirectResponse(
-            f"/dashboard/lots/{lot_id}/spaces/{space_id}?created=1",
-            status_code=303,
-        )
-
-    except ValueError as error:
-        with database.SessionLocal() as db:
-            space = db.get(ParkingSpace, space_id)
-            lot = space.lot if space else None
-            bookings = []
-            if space:
-                bookings = db.scalars(
-                    select(Booking)
-                    .where(Booking.space_id == space.id)
-                    .order_by(Booking.id)
-                ).all()
-        return render(
-            request,
-            "customer_space.html",
-            {
-                "lot": lot,
-                "space": space,
-                "get_space_status": get_space_status,
-                "status": get_space_status(space)[0] if space else None,
-                "color": get_space_status(space)[1] if space else "green",
-                "bookings": bookings,
-                "user_id": user.id,
-                "form_values": values,
-                "form_errors": {"form": str(error)},
-                "message": None,
-            },
-            400,
-        )
-    except IntegrityError:
-        with database.SessionLocal() as db:
-            space = db.get(ParkingSpace, space_id)
-            lot = space.lot if space else None
-            bookings = []
-            if space:
-                bookings = db.scalars(
-                    select(Booking)
-                    .where(Booking.space_id == space.id)
-                    .order_by(Booking.id)
-                ).all()
-        return RedirectResponse(
-            f"/dashboard/lots/{lot_id}/spaces/{space_id}?conflict=1",
-            status_code=303,
-        )
-    except Exception:
-        logger.exception("Unexpected error while creating booking")
-        with database.SessionLocal() as db:
-            space = db.get(ParkingSpace, space_id)
-            lot = space.lot if space else None
-            bookings = []
-            if space:
-                bookings = db.scalars(
-                    select(Booking)
-                    .where(Booking.space_id == space.id)
-                    .order_by(Booking.id)
-                ).all()
-        return render(
-            request,
-            "customer_space.html",
-            {
-                "lot": lot,
-                "space": space,
-                "get_space_status": get_space_status,
-                "status": get_space_status(space)[0] if space else None,
-                "color": get_space_status(space)[1] if space else "green",
-                "bookings": bookings,
-                "user_id": user.id,
-                "form_values": values,
-                "form_errors": {"form": "An unexpected error occurred. Please try again."},
-                "message": None,
-            },
-            500,
-        )
-
-
-@app.post(
-    "/dashboard/lots/{lot_id:int}/spaces/{space_id:int}/start",
-    response_class=HTMLResponse,
-    summary="Start a pending ticket",
-)
-async def start_booking(request: Request, lot_id: int, space_id: int) -> HTMLResponse:
-    user = signed_in_user(request)
-    if not user:
-        return RedirectResponse("/login", status_code=303)
-    require_customer(user)
-
-    form = await request.form()
-    booking_id_field = str(form.get("booking_id", ""))
-    if not booking_id_field.isdigit():
-        return RedirectResponse(
-            f"/dashboard/lots/{lot_id}/spaces/{space_id}?invalid=1",
-            status_code=303,
-        )
-    booking_id = int(booking_id_field)
-
-    try:
-        with database.SessionLocal.begin() as db:
-            booking = db.get(Booking, booking_id)
-            if not booking or booking.space_id != space_id:
-                return RedirectResponse(
-                    f"/dashboard/lots/{lot_id}/spaces/{space_id}?not_found=1",
-                    status_code=303,
-                )
-            _require_current_user_booking(request, booking)
-            if booking.status != BookingStatus.PENDING:
-                return RedirectResponse(
-                    f"/dashboard/lots/{lot_id}/spaces/{space_id}?invalid=1",
-                    status_code=303,
-                )
-            booking.status = BookingStatus.ACTIVE
-            booking.started_at = now_utc()
-
-        return RedirectResponse(
-            f"/dashboard/lots/{lot_id}/spaces/{space_id}?started=1",
-            status_code=303,
-        )
-
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Unexpected error while starting booking")
-        return RedirectResponse(
-            f"/dashboard/lots/{lot_id}/spaces/{space_id}?invalid=1",
-            status_code=303,
-        )
-
-
-@app.post(
-    "/dashboard/lots/{lot_id:int}/spaces/{space_id:int}/end",
-    response_class=HTMLResponse,
-    summary="End an active ticket",
-)
-async def end_booking(request: Request, lot_id: int, space_id: int) -> HTMLResponse:
-    user = signed_in_user(request)
-    if not user:
-        return RedirectResponse("/login", status_code=303)
-    require_customer(user)
-
-    form = await request.form()
-    booking_id_field = str(form.get("booking_id", ""))
-    if not booking_id_field.isdigit():
-        return RedirectResponse(
-            f"/dashboard/lots/{lot_id}/spaces/{space_id}?invalid=1",
-            status_code=303,
-        )
-    booking_id = int(booking_id_field)
-
-    try:
-        with database.SessionLocal.begin() as db:
-            booking = db.get(Booking, booking_id)
-            if not booking or booking.space_id != space_id:
-                return RedirectResponse(
-                    f"/dashboard/lots/{lot_id}/spaces/{space_id}?not_found=1",
-                    status_code=303,
-                )
-            _require_current_user_booking(request, booking)
-            if booking.status != BookingStatus.ACTIVE:
-                return RedirectResponse(
-                    f"/dashboard/lots/{lot_id}/spaces/{space_id}?invalid=1",
-                    status_code=303,
-                )
-            booking.status = BookingStatus.COMPLETED
-            booking.ended_at = now_utc()
-
-        return RedirectResponse(
-            f"/dashboard/lots/{lot_id}/spaces/{space_id}?ended=1",
-            status_code=303,
-        )
-
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Unexpected error while ending booking")
-        return RedirectResponse(
-            f"/dashboard/lots/{lot_id}/spaces/{space_id}?invalid=1",
-            status_code=303,
-        )
-
-
-@app.post(
-    "/dashboard/lots/{lot_id:int}/spaces/{space_id:int}/cancel",
-    response_class=HTMLResponse,
-    summary="Cancel a pending booking",
-)
-async def cancel_booking(request: Request, lot_id: int, space_id: int) -> HTMLResponse:
-    user = signed_in_user(request)
-    if not user:
-        return RedirectResponse("/login", status_code=303)
-    require_customer(user)
-
-    form = await request.form()
-    booking_id_field = str(form.get("booking_id", ""))
-    if not booking_id_field.isdigit():
-        return RedirectResponse(
-            f"/dashboard/lots/{lot_id}/spaces/{space_id}?invalid=1",
-            status_code=303,
-        )
-    booking_id = int(booking_id_field)
-
-    try:
-        with database.SessionLocal.begin() as db:
-            booking = db.get(Booking, booking_id)
-            if not booking or booking.space_id != space_id:
-                return RedirectResponse(
-                    f"/dashboard/lots/{lot_id}/spaces/{space_id}?not_found=1",
-                    status_code=303,
-                )
-            _require_current_user_booking(request, booking)
-            if booking.status != BookingStatus.PENDING:
-                return RedirectResponse(
-                    f"/dashboard/lots/{lot_id}/spaces/{space_id}?invalid=1",
-                    status_code=303,
-                )
-            booking.status = BookingStatus.CANCELLED
-
-        return RedirectResponse(
-            f"/dashboard/lots/{lot_id}/spaces/{space_id}?cancelled=1",
-            status_code=303,
-        )
-
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Unexpected error while cancelling booking")
-        return RedirectResponse(
-            f"/dashboard/lots/{lot_id}/spaces/{space_id}?invalid=1",
-            status_code=303,
-        )
 
 
 @app.post(
@@ -1416,6 +1919,9 @@ def api_change_password(
     return APIResponse(message="Password updated. Sign in again with your new password.")
 
 
+# ---------------------------------------------------------------------------
+# Registration / sign-in pages
+# ---------------------------------------------------------------------------
 @app.get("/register", response_class=HTMLResponse, summary="Show the registration form")
 async def register_page(request: Request, message: str = ""):
     if request.session.get("email") and signed_in_user(request):
@@ -1434,7 +1940,9 @@ async def register_page(request: Request, message: str = ""):
     )
 
 
-@app.post("/register", response_class=HTMLResponse, summary="Submit the registration form")
+@app.post(
+    "/register", response_class=HTMLResponse, summary="Submit the registration form"
+)
 async def register(request: Request):
     form = await request.form()
     google_registration = request.session.get("google_registration", {})
@@ -1458,7 +1966,7 @@ async def register(request: Request):
             request,
             "register.html",
             {
-                "error": "Your session expired. Please try again.",
+                "error": CSRF_MESSAGE,
                 "full_name": full_name,
                 "email": email,
                 "phone": phone,
@@ -1469,11 +1977,12 @@ async def register(request: Request):
             403,
         )
 
+    field_errors: dict[str, str] = {}
+    payload: Register | None = None
     try:
         payload = Register.model_validate(values)
         if payload.state not in US_STATES:
             raise ValueError("Select a valid state.")
-        field_errors = {}
     except ValidationError as error:
         field_errors, _ = validation_messages(error)
     except ValueError as error:
@@ -1489,21 +1998,17 @@ async def register(request: Request):
         "google_registration": bool(google_email),
         "states": US_STATES,
     }
-    if field_errors:
+    if field_errors or payload is None:
         return render(request, "register.html", context, 400)
 
     try:
         with database.SessionLocal() as db:
-            payload = payload.model_copy(update={"role": "customer"})
             user = create_registered_user(db, payload)
     except IntegrityError:
         return render(
             request,
             "register.html",
-            {
-                **context,
-                "error": "An account with this email already exists.",
-            },
+            {**context, "error": "An account with this email already exists."},
             409,
         )
     except Exception:
@@ -1533,7 +2038,7 @@ async def login_page(request: Request, message: str = ""):
 async def login(request: Request):
     form = await request.form()
     if not csrf_is_valid(request, form):
-        return render(request, "login.html", {"error": "Your session expired. Please try again."}, 403)
+        return render(request, "login.html", {"error": CSRF_MESSAGE}, 403)
 
     try:
         payload = Login.model_validate(
@@ -1588,9 +2093,7 @@ async def login(request: Request):
                 request,
                 "login.html",
                 {
-                    "error": (
-                        "Verification failed. Please complete the CAPTCHA to proceed."
-                    ),
+                    "error": "Verification failed. Please complete the CAPTCHA to proceed.",
                     "email_value": email,
                 },
                 401,
@@ -1609,9 +2112,7 @@ async def login(request: Request):
             )
         assert user is not None
         start_session(request, user, remember=payload.remember)
-        if user.role == "admin":
-            return RedirectResponse("/admin", status_code=303)
-        return RedirectResponse("/dashboard", status_code=303)
+        return RedirectResponse(landing_page_for(user), status_code=303)
     except Exception:
         logger.exception("Unexpected error while signing in")
         return render(
@@ -1625,34 +2126,39 @@ async def login(request: Request):
         )
 
 
-#checks the csrf token submitted in the form against the expected token stored in the user's session.
-#If the tokens do not match, it redirects the user to the login page with an error message. 
-# If the tokens match, it clears the user's session and redirects them to the login page with a success message.
 @app.post("/logout", summary="Sign out of the current session")
 async def logout(request: Request):
     form = await request.form()
     if not csrf_is_valid(request, form):
-        return redirect_to_login("Your session expired. Please try again.")
+        return redirect_to_login(CSRF_MESSAGE)
     request.session.clear()
     return RedirectResponse("/login", status_code=303)
 
 
-#an endpoint to handle GET requests to the /forgot-password URL. It renders the forgot_password.html template, which contains a form for users to request a password reset.
-@app.get("/forgot-password", response_class=HTMLResponse, summary="Show password reset request form")
+# ---------------------------------------------------------------------------
+# Password recovery / change
+# ---------------------------------------------------------------------------
+@app.get(
+    "/forgot-password",
+    response_class=HTMLResponse,
+    summary="Show password reset request form",
+)
 async def forgot_password_page(request: Request):
     return render(request, "forgot_password.html")
 
 
-@app.post("/forgot-password", response_class=HTMLResponse, summary="Request a password reset link")
+@app.post(
+    "/forgot-password",
+    response_class=HTMLResponse,
+    summary="Request a password reset link",
+)
 async def forgot_password(request: Request, background_tasks: BackgroundTasks):
     form = await request.form()
     if not csrf_is_valid(request, form):
-        return render(request, "forgot_password.html", {"error": "Your session expired. Please try again."}, 403)
+        return render(request, "forgot_password.html", {"error": CSRF_MESSAGE}, 403)
 
     try:
-        payload = ForgotPassword.model_validate(
-            {"email": str(form.get("email", ""))}
-        )
+        payload = ForgotPassword.model_validate({"email": str(form.get("email", ""))})
     except ValidationError as error:
         _, message = validation_messages(error)
         return render(request, "forgot_password.html", {"error": message}, 400)
@@ -1666,26 +2172,41 @@ async def forgot_password(request: Request, background_tasks: BackgroundTasks):
             reset_url = f"{base_url}/reset-password?token={raw_token}"
             background_tasks.add_task(send_reset_email, payload.email, reset_url)
         else:
-            logger.error("PUBLIC_BASE_URL must be configured to send password reset links")
+            logger.error(
+                "PUBLIC_BASE_URL must be configured to send password reset links"
+            )
 
     return render(
         request,
         "forgot_password.html",
-        {"success": "If an account matches that email, password reset instructions are on their way."},
+        {
+            "success": "If an account matches that email, password reset instructions are on their way."
+        },
     )
 
 
-@app.get("/reset-password", response_class=HTMLResponse, summary="Show the password reset form")
+@app.get(
+    "/reset-password",
+    response_class=HTMLResponse,
+    summary="Show the password reset form",
+)
 async def reset_password_page(request: Request, token: str = ""):
     return render(request, "reset_password.html", {"token": token})
 
 
-@app.post("/reset-password", response_class=HTMLResponse, summary="Submit a password reset")
+@app.post(
+    "/reset-password", response_class=HTMLResponse, summary="Submit a password reset"
+)
 async def reset_password(request: Request):
     form = await request.form()
     token = str(form.get("token", ""))
     if not csrf_is_valid(request, form):
-        return render(request, "reset_password.html", {"token": token, "error": "Your session expired. Please try again."}, 403)
+        return render(
+            request,
+            "reset_password.html",
+            {"token": token, "error": CSRF_MESSAGE},
+            403,
+        )
     try:
         payload = ResetPassword.model_validate(
             {
@@ -1697,21 +2218,27 @@ async def reset_password(request: Request):
     except ValidationError as error:
         _, message = validation_messages(error)
         return render(
-            request,
-            "reset_password.html",
-            {"token": token, "error": message},
-            400,
+            request, "reset_password.html", {"token": token, "error": message}, 400
         )
 
     with database.SessionLocal() as db:
         reset = reset_user_password(db, payload)
     if not reset:
-        return render(request, "reset_password.html", {"token": "", "error": "This reset link is invalid or has expired."}, 400)
+        return render(
+            request,
+            "reset_password.html",
+            {"token": "", "error": "This reset link is invalid or has expired."},
+            400,
+        )
     request.session.clear()
     return redirect_to_login("Password updated. Sign in with your new password.")
 
 
-@app.get("/change-password", response_class=HTMLResponse, summary="Show password change form")
+@app.get(
+    "/change-password",
+    response_class=HTMLResponse,
+    summary="Show password change form",
+)
 async def change_password_page(request: Request):
     user = signed_in_user(request)
     if not user:
@@ -1719,14 +2246,18 @@ async def change_password_page(request: Request):
     return render(request, "change_password.html")
 
 
-@app.post("/change-password", response_class=HTMLResponse, summary="Change the signed-in user's password")
+@app.post(
+    "/change-password",
+    response_class=HTMLResponse,
+    summary="Change the signed-in user's password",
+)
 async def change_password(request: Request):
     user = signed_in_user(request)
     if not user:
         return redirect_to_login("Please sign in to change your password.")
     form = await request.form()
     if not csrf_is_valid(request, form):
-        return render(request, "change_password.html", {"error": "Your session expired. Please try again."}, 403)
+        return render(request, "change_password.html", {"error": CSRF_MESSAGE}, 403)
 
     try:
         payload = ChangePassword.model_validate(
@@ -1746,11 +2277,19 @@ async def change_password(request: Request):
             return redirect_to_login("Please sign in to change your password.")
         changed = change_user_password(db, db_user, payload)
     if not changed:
-        return render(request, "change_password.html", {"error": "Your current password is incorrect."}, 400)
+        return render(
+            request,
+            "change_password.html",
+            {"error": "Your current password is incorrect."},
+            400,
+        )
     request.session.clear()
     return redirect_to_login("Password updated. Sign in again with your new password.")
 
 
+# ---------------------------------------------------------------------------
+# Google sign-in
+# ---------------------------------------------------------------------------
 @app.get("/auth/google", summary="Start Google sign-in")
 async def google_login(request: Request, flow: str = "login"):
     flow = "signup" if flow == "signup" else "login"
@@ -1759,10 +2298,14 @@ async def google_login(request: Request, flow: str = "login"):
         query = urlencode({"message": "Google sign-in is not configured yet."})
         return RedirectResponse(f"{destination}?{query}", status_code=303)
     request.session["google_flow"] = flow
-    return await oauth.google.authorize_redirect(request, str(request.url_for("google_callback")))
+    return await oauth.google.authorize_redirect(
+        request, str(request.url_for("google_callback"))
+    )
 
 
-@app.get("/auth/google/callback", name="google_callback", summary="Complete Google sign-in")
+@app.get(
+    "/auth/google/callback", name="google_callback", summary="Complete Google sign-in"
+)
 async def google_callback(request: Request):
     flow = request.session.get("google_flow", "login")
     try:
@@ -1791,6 +2334,7 @@ async def google_callback(request: Request):
     }
     create_csrf_token(request)
     return RedirectResponse("/register", status_code=303)
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
