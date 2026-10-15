@@ -3,7 +3,6 @@ import hmac
 import logging
 import uvicorn
 import os
-import re
 import secrets
 import smtplib
 import time
@@ -12,17 +11,29 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 import httpx
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from authlib.integrations.starlette_client import OAuth
-from fastapi import BackgroundTasks, FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import BackgroundTasks, Depends, FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from pydantic import ValidationError
+from sqlalchemy.orm import Session
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.templating import Jinja2Templates
 
 import database
 from models import User
+from schemas import (
+    APIResponse,
+    ChangePassword,
+    ForgotPassword,
+    Login,
+    Register,
+    ResetPassword,
+    UserResponse,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 APP_ENV = os.getenv("APP_ENV", "development").lower()
@@ -113,6 +124,117 @@ def render(
 def get_user(email: str) -> User | None:
     with database.SessionLocal() as db:
         return db.get(User, email)
+
+
+def validation_messages(error: ValidationError) -> tuple[dict[str, str], str]:
+    field_errors: dict[str, str] = {}
+    first_message = "Field is required."
+    for item in error.errors():
+        location = item["loc"]
+        field = str(location[-1]) if location else "form"
+        message = str(item.get("ctx", {}).get("error", item["msg"]))
+        if item["type"] == "missing":
+            message = "Field is required."
+        elif message.startswith("Value error, "):
+            message = message.removeprefix("Value error, ")
+        if (
+            field == "form"
+            and "terms and conditions" in message
+        ):
+            field = "terms"
+        field_errors[field] = message
+        if first_message == "Field is required." or field == "terms":
+            first_message = message
+    return field_errors, first_message
+
+
+def create_registered_user(db: Session, payload: Register) -> User:
+    user = User(
+        email=payload.email,
+        password_hash=hash_password(payload.password),
+        full_name=payload.full_name,
+        phone=payload.phone,
+        state=payload.state,
+        terms_accepted_at=int(time.time()),
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def authenticate_user(
+    db: Session, email: str, password: str, now: int | None = None
+) -> tuple[User | None, str | None, int]:
+    current_time = int(time.time()) if now is None else now
+    user = db.get(User, email)
+    if user and user.locked_until is not None and user.locked_until > current_time:
+        return (
+            None,
+            "Your account has been locked due to multiple unsuccessful sign-in attempts. "
+            "Please reset your password.",
+            423,
+        )
+    if not user or not verify_password(password, user.password_hash):
+        if user:
+            failed_attempts = int(user.failed_attempts or 0)
+            if user.locked_until is not None and user.locked_until <= current_time:
+                failed_attempts = 0
+            failed_attempts += 1
+            user.failed_attempts = failed_attempts
+            user.locked_until = (
+                current_time + SIGN_IN_LOCKOUT_LENGTH
+                if failed_attempts >= SIGN_IN_MAX_FAILED_ATTEMPTS
+                else None
+            )
+            db.commit()
+        return None, "Incorrect email or password.", 401
+    user.failed_attempts = 0
+    user.locked_until = None
+    db.commit()
+    return user, None, 200
+
+
+def issue_reset_token(db: Session, email: str) -> str | None:
+    user = db.get(User, email)
+    if not user:
+        return None
+    raw_token = secrets.token_urlsafe(32)
+    user.reset_token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    user.reset_expires_at = int(time.time()) + RESET_TOKEN_LENGTH
+    db.commit()
+    return raw_token
+
+
+def reset_user_password(db: Session, payload: ResetPassword) -> bool:
+    token_hash = hashlib.sha256(payload.token.encode()).hexdigest()
+    user = db.scalar(
+        select(User).where(
+            User.reset_token_hash == token_hash,
+            User.reset_expires_at > int(time.time()),
+        )
+    )
+    if not user:
+        return False
+    user.password_hash = hash_password(payload.password)
+    user.reset_token_hash = None
+    user.reset_expires_at = None
+    user.failed_attempts = 0
+    user.locked_until = None
+    db.commit()
+    return True
+
+
+def change_user_password(
+    db: Session, user: User, payload: ChangePassword
+) -> bool:
+    if not verify_password(payload.current_password, user.password_hash):
+        return False
+    user.password_hash = hash_password(payload.password)
+    user.reset_token_hash = None
+    user.reset_expires_at = None
+    db.commit()
+    return True
 
 
 #It checks the session for the user's email and expiration time, 
@@ -209,6 +331,27 @@ def send_reset_email(email: str, reset_url: str) -> None:
 #It also sets the session cookie name, max age, same site policy, 
 #and whether it should be sent over HTTPS only in production.
 app = FastAPI(title="Sign-In Portal")
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    del request
+    errors = exc.errors()
+    if not errors:
+        message = "Field is required."
+    else:
+        error = errors[0]
+        if error["type"] == "missing":
+            message = "Field is required."
+        else:
+            message = str(error.get("ctx", {}).get("error", error["msg"]))
+            if message.startswith("Value error, "):
+                message = message.removeprefix("Value error, ")
+    return JSONResponse(status_code=422, content={"detail": message})
+
+
 app.add_middleware(
     SessionMiddleware,
     secret_key=SECRET_KEY,
@@ -243,7 +386,7 @@ async def security_headers(request: Request, call_next):
     return response
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse, summary="Show the signed-in account page")
 async def home(request: Request):
     user = signed_in_user(request)
     if not user:
@@ -262,8 +405,165 @@ async def home(request: Request):
     )
 
 
-@app.get("/register", response_class=HTMLResponse)
-async def register_page(request: Request):
+@app.get(
+    "/api/me",
+    response_model=UserResponse,
+    summary="Get the signed-in user's public profile",
+)
+def api_current_user(request: Request, db: Session = Depends(database.get_db)):
+    signed_user = signed_in_user(request)
+    if not signed_user:
+        return JSONResponse(status_code=401, content={"detail": "Not signed in."})
+    user = db.get(User, signed_user.email)
+    if not user:
+        return JSONResponse(status_code=401, content={"detail": "Not signed in."})
+    return user
+
+
+@app.post(
+    "/api/register",
+    response_model=APIResponse,
+    status_code=201,
+    summary="Create an account",
+)
+def api_register(payload: Register, request: Request, db: Session = Depends(database.get_db)):
+    google_registration = request.session.get("google_registration", {})
+    if google_registration.get("email"):
+        payload = payload.model_copy(
+            update={
+                "email": str(google_registration["email"]).strip().lower(),
+                "full_name": payload.full_name
+                or str(google_registration.get("name", "")).strip(),
+            }
+        )
+    if payload.state not in US_STATES:
+        return JSONResponse(
+            status_code=422, content={"detail": "Select a valid state."}
+        )
+    try:
+        user = create_registered_user(db, payload)
+    except IntegrityError:
+        db.rollback()
+        return JSONResponse(
+            status_code=409,
+            content={"detail": "An account with this email already exists."},
+        )
+    start_session(request, user)
+    return APIResponse(message=f"Welcome, {user.full_name}!", user=user)
+
+
+@app.post(
+    "/api/login",
+    response_model=APIResponse,
+    summary="Sign in and start a session",
+)
+async def api_login(
+    payload: Login, request: Request, db: Session = Depends(database.get_db)
+):
+    if not payload.captcha:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Please complete the reCAPTCHA."},
+        )
+    verified = await recaptcha_is_valid(
+        payload.captcha, request.client.host if request.client else None
+    )
+    if not verified:
+        return JSONResponse(
+            status_code=401,
+            content={
+                "detail": (
+                    "Verification failed. Please complete the CAPTCHA to proceed."
+                )
+            },
+        )
+    user, error, status_code = authenticate_user(
+        db, payload.email, payload.password
+    )
+    if error:
+        return JSONResponse(status_code=status_code, content={"detail": error})
+    assert user is not None
+    start_session(request, user, remember=payload.remember)
+    return APIResponse(message="Sign in successful.", user=user)
+
+
+@app.post(
+    "/api/forgot-password",
+    response_model=APIResponse,
+    summary="Request a password reset link",
+)
+def api_forgot_password(
+    payload: ForgotPassword,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(database.get_db),
+):
+    token = issue_reset_token(db, payload.email)
+    if token:
+        public_base_url = os.getenv("PUBLIC_BASE_URL")
+        if public_base_url or APP_ENV != "production":
+            base_url = (public_base_url or str(request.base_url)).rstrip("/")
+            background_tasks.add_task(
+                send_reset_email,
+                payload.email,
+                f"{base_url}/reset-password?token={token}",
+            )
+        else:
+            logger.error("PUBLIC_BASE_URL must be configured to send password reset links")
+    return APIResponse(
+        message="If an account matches that email, password reset instructions are on their way."
+    )
+
+
+@app.post(
+    "/api/reset-password",
+    response_model=APIResponse,
+    summary="Reset a password with a token",
+)
+def api_reset_password(payload: ResetPassword, db: Session = Depends(database.get_db)):
+    if not reset_user_password(db, payload):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "detail": "This reset link is invalid or has expired."
+            },
+        )
+    return APIResponse(message="Password updated. Sign in with your new password.")
+
+
+@app.post(
+    "/api/change-password",
+    response_model=APIResponse,
+    summary="Change the signed-in user's password",
+)
+def api_change_password(
+    payload: ChangePassword,
+    request: Request,
+    db: Session = Depends(database.get_db),
+):
+    signed_user = signed_in_user(request)
+    if not signed_user:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Please sign in to change your password."},
+        )
+    user = db.get(User, signed_user.email)
+    if user is None:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Please sign in to change your password."},
+        )
+    if not change_user_password(db, user, payload):
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Your current password is incorrect."},
+        )
+    request.session.clear()
+    return APIResponse(message="Password updated. Sign in again with your new password.")
+
+
+@app.get("/register", response_class=HTMLResponse, summary="Show the registration form")
+async def register_page(request: Request, message: str = ""):
     if request.session.get("email") and signed_in_user(request):
         return RedirectResponse("/", status_code=303)
     google_registration = request.session.get("google_registration", {})
@@ -275,22 +575,29 @@ async def register_page(request: Request):
             "email": google_registration.get("email", ""),
             "google_registration": bool(google_registration.get("email")),
             "states": US_STATES,
+            "message": message,
         },
     )
 
 
-@app.post("/register", response_class=HTMLResponse)
+@app.post("/register", response_class=HTMLResponse, summary="Submit the registration form")
 async def register(request: Request):
     form = await request.form()
     google_registration = request.session.get("google_registration", {})
     google_email = str(google_registration.get("email", "")).strip().lower()
-    full_name = str(form.get("full_name", "")).strip()
-    if google_email and not full_name:
-        full_name = str(google_registration.get("name", "")).strip()
-    email = google_email or str(form.get("email", "")).strip().lower()
-    password = str(form.get("password", ""))
-    phone = str(form.get("phone", "")).strip()
-    state = str(form.get("state", "")).strip()
+    values = {
+        "full_name": str(form.get("full_name", "")).strip()
+        or str(google_registration.get("name", "")).strip(),
+        "email": google_email or str(form.get("email", "")).strip(),
+        "password": str(form.get("password", "")),
+        "phone": str(form.get("phone", "")).strip(),
+        "state": str(form.get("state", "")).strip(),
+        "terms": form.get("terms") == "on",
+    }
+    full_name = values["full_name"]
+    email = values["email"]
+    phone = values["phone"]
+    state = values["state"]
 
     if not csrf_is_valid(request, form):
         return render(
@@ -308,27 +615,15 @@ async def register(request: Request):
             403,
         )
 
-    field_errors: dict[str, str] = {}
-    for field, value in (
-        ("full_name", full_name),
-        ("email", email),
-        ("password", password),
-        ("phone", phone),
-        ("state", state),
-    ):
-        if not value:
-            field_errors[field] = "Field is required."
-    terms_accepted = form.get("terms") == "on"
-    if not terms_accepted:
-        field_errors["terms"] = (
-            "You must accept the terms and conditions to register."
-        )
-    if password and len(password) < 6:
-        field_errors["password"] = "Password must be at least 6 characters."
-    if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
-        field_errors["email"] = "Invalid email format."
-    if state and state not in US_STATES:
-        field_errors["state"] = "Select a valid state."
+    try:
+        payload = Register.model_validate(values)
+        if payload.state not in US_STATES:
+            raise ValueError("Select a valid state.")
+        field_errors = {}
+    except ValidationError as error:
+        field_errors, _ = validation_messages(error)
+    except ValueError as error:
+        field_errors = {"state": str(error)}
 
     context: dict[str, object] = {
         "field_errors": field_errors,
@@ -336,7 +631,7 @@ async def register(request: Request):
         "email": email,
         "phone": phone,
         "state": state,
-        "terms_checked": terms_accepted,
+        "terms_checked": values["terms"],
         "google_registration": bool(google_email),
         "states": US_STATES,
     }
@@ -345,16 +640,7 @@ async def register(request: Request):
 
     try:
         with database.SessionLocal() as db:
-            user = User(
-                email=email,
-                password_hash=hash_password(password),
-                full_name=full_name,
-                phone=phone,
-                state=state,
-                terms_accepted_at=int(time.time()),
-            )
-            db.add(user)
-            db.commit()
+            user = create_registered_user(db, payload)
     except IntegrityError:
         return render(
             request,
@@ -381,29 +667,31 @@ async def register(request: Request):
     return RedirectResponse("/?welcome=1", status_code=303)
 
 
-@app.get("/login", response_class=HTMLResponse)
+@app.get("/login", response_class=HTMLResponse, summary="Show the sign-in form")
 async def login_page(request: Request, message: str = ""):
     if signed_in_user(request):
         return RedirectResponse("/", status_code=303)
     return render(request, "login.html", {"message": message})
 
 
-@app.post("/login", response_class=HTMLResponse)
+@app.post("/login", response_class=HTMLResponse, summary="Submit the sign-in form")
 async def login(request: Request):
     form = await request.form()
     if not csrf_is_valid(request, form):
         return render(request, "login.html", {"error": "Your session expired. Please try again."}, 403)
 
-    email = str(form.get("email", "")).strip().lower()
-    password = str(form.get("password", ""))
-    field_errors: dict[str, str] = {}
-    if not email:
-        field_errors["email"] = "Email is required."
-    elif not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
-        field_errors["email"] = "Invalid email format."
-    if not password:
-        field_errors["password"] = "Password is required."
-    if field_errors:
+    try:
+        payload = Login.model_validate(
+            {
+                "email": str(form.get("email", "")),
+                "password": str(form.get("password", "")),
+                "captcha": str(form.get("g-recaptcha-response", "")),
+                "remember": form.get("remember") == "on",
+            }
+        )
+    except ValidationError as validation_error:
+        field_errors, _ = validation_messages(validation_error)
+        email = str(form.get("email", "")).strip().lower()
         return render(
             request,
             "login.html",
@@ -411,8 +699,8 @@ async def login(request: Request):
             400,
         )
 
-    captcha = str(form.get("g-recaptcha-response", ""))
-    if not captcha:
+    email = payload.email
+    if not payload.captcha:
         return render(
             request,
             "login.html",
@@ -421,8 +709,8 @@ async def login(request: Request):
         )
 
     try:
-        user = get_user(email)
         now = int(time.time())
+        user = get_user(email)
         if user and user.locked_until is not None and user.locked_until > now:
             return render(
                 request,
@@ -438,7 +726,7 @@ async def login(request: Request):
             )
 
         verified = await recaptcha_is_valid(
-            captcha, request.client.host if request.client else None
+            payload.captcha, request.client.host if request.client else None
         )
         if not verified:
             return render(
@@ -453,41 +741,19 @@ async def login(request: Request):
                 401,
             )
 
-        if not user or not verify_password(password, user.password_hash):
-            if user:
-                failed_attempts = int(user.failed_attempts or 0)
-                if user.locked_until is not None and user.locked_until <= now:
-                    failed_attempts = 0
-                failed_attempts += 1
-                locked_until = (
-                    now + SIGN_IN_LOCKOUT_LENGTH
-                    if failed_attempts >= SIGN_IN_MAX_FAILED_ATTEMPTS
-                    else None
-                )
-                with database.SessionLocal.begin() as db:
-                    db.execute(
-                        update(User)
-                        .where(User.email == email)
-                        .values(
-                            failed_attempts=failed_attempts,
-                            locked_until=locked_until,
-                        )
-                    )
+        with database.SessionLocal() as db:
+            user, error, status_code = authenticate_user(
+                db, email, payload.password, now
+            )
+        if error:
             return render(
                 request,
                 "login.html",
-                {"error": "Incorrect email or password.", "email_value": email},
-                401,
+                {"error": error, "email_value": email},
+                status_code,
             )
-
-        with database.SessionLocal.begin() as db:
-            db.execute(
-                update(User)
-                .where(User.email == email)
-                .values(failed_attempts=0, locked_until=None)
-            )
-
-        start_session(request, user, remember=form.get("remember") == "on")
+        assert user is not None
+        start_session(request, user, remember=payload.remember)
         return RedirectResponse("/", status_code=303)
     except Exception:
         logger.exception("Unexpected error while signing in")
@@ -505,7 +771,7 @@ async def login(request: Request):
 #checks the csrf token submitted in the form against the expected token stored in the user's session.
 #If the tokens do not match, it redirects the user to the login page with an error message. 
 # If the tokens match, it clears the user's session and redirects them to the login page with a success message.
-@app.post("/logout")
+@app.post("/logout", summary="Sign out of the current session")
 async def logout(request: Request):
     form = await request.form()
     if not csrf_is_valid(request, form):
@@ -515,36 +781,33 @@ async def logout(request: Request):
 
 
 #an endpoint to handle GET requests to the /forgot-password URL. It renders the forgot_password.html template, which contains a form for users to request a password reset.
-@app.get("/forgot-password", response_class=HTMLResponse)
+@app.get("/forgot-password", response_class=HTMLResponse, summary="Show password reset request form")
 async def forgot_password_page(request: Request):
     return render(request, "forgot_password.html")
 
 
-@app.post("/forgot-password", response_class=HTMLResponse)
+@app.post("/forgot-password", response_class=HTMLResponse, summary="Request a password reset link")
 async def forgot_password(request: Request, background_tasks: BackgroundTasks):
     form = await request.form()
     if not csrf_is_valid(request, form):
         return render(request, "forgot_password.html", {"error": "Your session expired. Please try again."}, 403)
 
-    email = str(form.get("email", "")).strip().lower()
-    user = get_user(email)
-    if user:
-        raw_token = secrets.token_urlsafe(32)
-        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
-        with database.SessionLocal.begin() as db:
-            db.execute(
-                update(User)
-                .where(User.email == email)
-                .values(
-                    reset_token_hash=token_hash,
-                    reset_expires_at=int(time.time()) + RESET_TOKEN_LENGTH,
-                )
-            )
+    try:
+        payload = ForgotPassword.model_validate(
+            {"email": str(form.get("email", ""))}
+        )
+    except ValidationError as error:
+        _, message = validation_messages(error)
+        return render(request, "forgot_password.html", {"error": message}, 400)
+
+    with database.SessionLocal() as db:
+        raw_token = issue_reset_token(db, payload.email)
+    if raw_token:
         public_base_url = os.getenv("PUBLIC_BASE_URL")
         if public_base_url or APP_ENV != "production":
             base_url = (public_base_url or str(request.base_url)).rstrip("/")
             reset_url = f"{base_url}/reset-password?token={raw_token}"
-            background_tasks.add_task(send_reset_email, email, reset_url)
+            background_tasks.add_task(send_reset_email, payload.email, reset_url)
         else:
             logger.error("PUBLIC_BASE_URL must be configured to send password reset links")
 
@@ -555,50 +818,43 @@ async def forgot_password(request: Request, background_tasks: BackgroundTasks):
     )
 
 
-@app.get("/reset-password", response_class=HTMLResponse)
+@app.get("/reset-password", response_class=HTMLResponse, summary="Show the password reset form")
 async def reset_password_page(request: Request, token: str = ""):
     return render(request, "reset_password.html", {"token": token})
 
 
-@app.post("/reset-password", response_class=HTMLResponse)
+@app.post("/reset-password", response_class=HTMLResponse, summary="Submit a password reset")
 async def reset_password(request: Request):
     form = await request.form()
     token = str(form.get("token", ""))
     if not csrf_is_valid(request, form):
         return render(request, "reset_password.html", {"token": token, "error": "Your session expired. Please try again."}, 403)
-    new_password = str(form.get("password", ""))
-    confirmation = str(form.get("confirm_password", ""))
-    if len(new_password) < 12:
-        return render(request, "reset_password.html", {"token": token, "error": "Use at least 12 characters for your new password."}, 400)
-    if new_password != confirmation:
-        return render(request, "reset_password.html", {"token": token, "error": "The passwords do not match."}, 400)
+    try:
+        payload = ResetPassword.model_validate(
+            {
+                "token": token,
+                "password": str(form.get("password", "")),
+                "confirm_password": str(form.get("confirm_password", "")),
+            }
+        )
+    except ValidationError as error:
+        _, message = validation_messages(error)
+        return render(
+            request,
+            "reset_password.html",
+            {"token": token, "error": message},
+            400,
+        )
 
-    token_hash = hashlib.sha256(token.encode()).hexdigest()
-    with database.SessionLocal.begin() as db:
-        user = db.scalar(
-            select(User).where(
-                User.reset_token_hash == token_hash,
-                User.reset_expires_at > int(time.time()),
-            )
-        )
-        if not user:
-            return render(request, "reset_password.html", {"token": "", "error": "This reset link is invalid or has expired."}, 400)
-        db.execute(
-            update(User)
-            .where(User.email == user.email)
-            .values(
-                password_hash=hash_password(new_password),
-                reset_token_hash=None,
-                reset_expires_at=None,
-                failed_attempts=0,
-                locked_until=None,
-            )
-        )
+    with database.SessionLocal() as db:
+        reset = reset_user_password(db, payload)
+    if not reset:
+        return render(request, "reset_password.html", {"token": "", "error": "This reset link is invalid or has expired."}, 400)
     request.session.clear()
     return redirect_to_login("Password updated. Sign in with your new password.")
 
 
-@app.get("/change-password", response_class=HTMLResponse)
+@app.get("/change-password", response_class=HTMLResponse, summary="Show password change form")
 async def change_password_page(request: Request):
     user = signed_in_user(request)
     if not user:
@@ -606,7 +862,7 @@ async def change_password_page(request: Request):
     return render(request, "change_password.html")
 
 
-@app.post("/change-password", response_class=HTMLResponse)
+@app.post("/change-password", response_class=HTMLResponse, summary="Change the signed-in user's password")
 async def change_password(request: Request):
     user = signed_in_user(request)
     if not user:
@@ -615,49 +871,57 @@ async def change_password(request: Request):
     if not csrf_is_valid(request, form):
         return render(request, "change_password.html", {"error": "Your session expired. Please try again."}, 403)
 
-    current_password = str(form.get("current_password", ""))
-    new_password = str(form.get("password", ""))
-    confirmation = str(form.get("confirm_password", ""))
-    if not verify_password(current_password, user.password_hash):
-        return render(request, "change_password.html", {"error": "Your current password is incorrect."}, 400)
-    if len(new_password) < 12:
-        return render(request, "change_password.html", {"error": "Use at least 12 characters for your new password."}, 400)
-    if new_password != confirmation:
-        return render(request, "change_password.html", {"error": "The passwords do not match."}, 400)
-
-    with database.SessionLocal.begin() as db:
-        db.execute(
-            update(User)
-            .where(User.email == user.email)
-            .values(
-                password_hash=hash_password(new_password),
-                reset_token_hash=None,
-                reset_expires_at=None,
-            )
+    try:
+        payload = ChangePassword.model_validate(
+            {
+                "current_password": str(form.get("current_password", "")),
+                "password": str(form.get("password", "")),
+                "confirm_password": str(form.get("confirm_password", "")),
+            }
         )
+    except ValidationError as error:
+        _, message = validation_messages(error)
+        return render(request, "change_password.html", {"error": message}, 400)
+
+    with database.SessionLocal() as db:
+        db_user = db.get(User, user.email)
+        if not db_user:
+            return redirect_to_login("Please sign in to change your password.")
+        changed = change_user_password(db, db_user, payload)
+    if not changed:
+        return render(request, "change_password.html", {"error": "Your current password is incorrect."}, 400)
     request.session.clear()
     return redirect_to_login("Password updated. Sign in again with your new password.")
 
 
-@app.get("/auth/google")
-async def google_login(request: Request):
+@app.get("/auth/google", summary="Start Google sign-in")
+async def google_login(request: Request, flow: str = "login"):
+    flow = "signup" if flow == "signup" else "login"
+    destination = "/register" if flow == "signup" else "/login"
     if not (os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET")):
-        return redirect_to_login("Google sign-in is not configured yet.")
+        query = urlencode({"message": "Google sign-in is not configured yet."})
+        return RedirectResponse(f"{destination}?{query}", status_code=303)
+    request.session["google_flow"] = flow
     return await oauth.google.authorize_redirect(request, str(request.url_for("google_callback")))
 
 
-@app.get("/auth/google/callback", name="google_callback")
+@app.get("/auth/google/callback", name="google_callback", summary="Complete Google sign-in")
 async def google_callback(request: Request):
+    flow = request.session.get("google_flow", "login")
     try:
         token = await oauth.google.authorize_access_token(request)
         profile = token.get("userinfo") or await oauth.google.userinfo(token=token)
     except Exception:
         logger.exception("Google OAuth callback failed")
-        return redirect_to_login("Google sign-in could not be completed.")
+        destination = "/register" if flow == "signup" else "/login"
+        query = urlencode({"message": "Google sign-in could not be completed."})
+        return RedirectResponse(f"{destination}?{query}", status_code=303)
 
     email = str(profile.get("email", "")).strip().lower()
     if not email or not profile.get("email_verified"):
-        return redirect_to_login("Google could not verify your email address.")
+        destination = "/register" if flow == "signup" else "/login"
+        query = urlencode({"message": "Google could not verify your email address."})
+        return RedirectResponse(f"{destination}?{query}", status_code=303)
     user = get_user(email)
     if user:
         start_session(request, user)

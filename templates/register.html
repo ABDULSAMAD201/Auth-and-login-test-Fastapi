@@ -7,6 +7,7 @@
   <p class="form-intro">Register to access your parking workspace.</p>
 </div>
 {% if error %}<div class="notice notice-error" role="alert">{{ error }}</div>{% endif %}
+{% if message %}<div class="notice notice-error" role="alert">{{ message }}</div>{% endif %}
 <form class="auth-form" action="/register" method="post">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
@@ -40,6 +41,6 @@
   <button class="primary-button" type="submit">Register <span aria-hidden="true">→</span></button>
 </form>
 <div class="divider"><span>OR CONTINUE WITH</span></div>
-<a class="google-button{% if not google_enabled %} google-disabled{% endif %}" href="/auth/google"{% if not google_enabled %} aria-label="Sign up with Google (not configured)"{% endif %}><svg viewBox="0 0 20 20" aria-hidden="true"><path fill="#4285F4" d="M18.4 10.2c0-.6-.1-1.2-.2-1.8H10v3.4h4.7a4 4 0 0 1-1.8 2.6v2.2h2.9c1.7-1.6 2.6-3.8 2.6-6.4Z"/><path fill="#34A853" d="M10 18.7c2.4 0 4.4-.8 5.8-2.1l-2.9-2.2c-.8.5-1.7.8-2.9.8-2.2 0-4.1-1.5-4.8-3.5H2.2v2.3a8.7 8.7 0 0 0 7.8 4.7Z"/><path fill="#FBBC05" d="M5.2 11.7a5.2 5.2 0 0 1 0-3.4V6H2.2a8.7 8.7 0 0 0 0 8l3-2.3Z"/><path fill="#EA4335" d="M10 4.8c1.3 0 2.5.5 3.4 1.3L16 3.5A8.5 8.5 0 0 0 10 1.2 8.7 8.7 0 0 0 2.2 6l3 2.3c.7-2 2.6-3.5 4.8-3.5Z"/></svg>Sign up with Google{% if not google_enabled %}<span class="setup-note">Setup needed</span>{% endif %}</a>
+<a class="google-button{% if not google_enabled %} google-disabled{% endif %}" href="/auth/google?flow=signup"{% if not google_enabled %} aria-label="Sign up with Google (not configured)"{% endif %}><svg viewBox="0 0 20 20" aria-hidden="true"><path fill="#4285F4" d="M18.4 10.2c0-.6-.1-1.2-.2-1.8H10v3.4h4.7a4 4 0 0 1-1.8 2.6v2.2h2.9c1.7-1.6 2.6-3.8 2.6-6.4Z"/><path fill="#34A853" d="M10 18.7c2.4 0 4.4-.8 5.8-2.1l-2.9-2.2c-.8.5-1.7.8-2.9.8-2.2 0-4.1-1.5-4.8-3.5H2.2v2.3a8.7 8.7 0 0 0 7.8 4.7Z"/><path fill="#FBBC05" d="M5.2 11.7a5.2 5.2 0 0 1 0-3.4V6H2.2a8.7 8.7 0 0 0 0 8l3-2.3Z"/><path fill="#EA4335" d="M10 4.8c1.3 0 2.5.5 3.4 1.3L16 3.5A8.5 8.5 0 0 0 10 1.2 8.7 8.7 0 0 0 2.2 6l3 2.3c.7-2 2.6-3.5 4.8-3.5Z"/></svg>Sign up with Google{% if not google_enabled %}<span class="setup-note">Setup needed</span>{% endif %}</a>
 <p class="register-signin">Already have an account? <a class="text-link" href="/login">Sign In</a></p>
 {% endblock %}

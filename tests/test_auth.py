@@ -3,12 +3,22 @@ from collections.abc import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 import database
 import main
 from models import Base, User
+from schemas import (
+    APIResponse,
+    ChangePassword,
+    ForgotPassword,
+    Login,
+    Register,
+    ResetPassword,
+    UserResponse,
+)
 
 
 @pytest.fixture
@@ -57,6 +67,276 @@ def test_password_hash_verification() -> None:
     encoded = main.hash_password("a-long-passphrase")
     assert main.verify_password("a-long-passphrase", encoded)
     assert not main.verify_password("a-different-passphrase", encoded)
+
+
+def test_request_models_validate_and_public_user_model_excludes_secrets() -> None:
+    register = Register(
+        full_name="Taylor Driver",
+        email="TAYLOR@example.com",
+        password="secure1",
+        phone="555-0100",
+        state="California",
+        terms=True,
+    )
+    assert register.email == "taylor@example.com"
+    assert Login(email="member@example.com", password="password").remember is False
+    assert ForgotPassword(email="member@example.com").email == "member@example.com"
+    assert ResetPassword(
+        token="reset-token",
+        password="long-enough-password",
+        confirm_password="long-enough-password",
+    )
+    assert ChangePassword(
+        current_password="current",
+        password="long-enough-password",
+        confirm_password="long-enough-password",
+    )
+
+    public_user = UserResponse(
+        email="member@example.com",
+        full_name="Member",
+        password_hash="must-not-appear",
+    )
+    response = APIResponse(message="ok", user=public_user).model_dump()
+    assert "password_hash" not in public_user.model_dump()
+    assert "password_hash" not in response["user"]
+
+
+@pytest.mark.parametrize(
+    ("model", "payload", "message"),
+    [
+        (
+            Login,
+            {"email": "", "password": "secret"},
+            "Email is required.",
+        ),
+        (
+            Login,
+            {"email": "not-an-email", "password": "secret"},
+            "Invalid email format.",
+        ),
+        (ForgotPassword, {"email": ""}, "Field is required."),
+        (
+            ResetPassword,
+            {
+                "token": "token",
+                "password": "long-enough-password",
+                "confirm_password": "different-password",
+            },
+            "The passwords do not match.",
+        ),
+        (
+            ChangePassword,
+            {
+                "current_password": "current",
+                "password": "short",
+                "confirm_password": "short",
+            },
+            "Use at least 12 characters for your new password.",
+        ),
+    ],
+)
+def test_request_models_return_spec_validation_messages(
+    model: type[BaseModel], payload: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValidationError) as error:
+        model.model_validate(payload)
+    assert message in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (
+            {
+                "full_name": "",
+                "email": "member@example.com",
+                "password": "long-enough",
+                "phone": "555",
+                "state": "CA",
+                "terms": True,
+            },
+            "Field is required.",
+        ),
+        (
+            {
+                "full_name": "Member",
+                "email": "member@example.com",
+                "password": "short",
+                "phone": "555",
+                "state": "CA",
+                "terms": True,
+            },
+            "Password must be at least 6 characters.",
+        ),
+        (
+            {
+                "full_name": "Member",
+                "email": "member@example.com",
+                "password": "long-enough",
+                "phone": "555",
+                "state": "CA",
+                "terms": False,
+            },
+            "You must accept the terms and conditions to register.",
+        ),
+    ],
+)
+def test_register_model_rejects_invalid_data(
+    payload: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValidationError) as error:
+        Register.model_validate(payload)
+    assert message in str(error.value)
+
+
+def test_openapi_documents_routes_with_summaries_and_safe_response_model(
+    client: TestClient,
+) -> None:
+    docs = client.get("/docs")
+    assert docs.status_code == 200
+    schema = client.get("/openapi.json").json()
+    for path, operations in schema["paths"].items():
+        for operation in operations.values():
+            assert operation.get("summary"), path
+    assert "/api/register" in schema["paths"]
+    assert "/api/login" in schema["paths"]
+    assert "/api/forgot-password" in schema["paths"]
+    assert "/api/reset-password" in schema["paths"]
+    assert "/api/change-password" in schema["paths"]
+
+    api_response = schema["components"]["schemas"]["APIResponse"]
+    user_schema = schema["components"]["schemas"]["UserResponse"]
+    assert "password_hash" not in user_schema["properties"]
+    assert "password_hash" not in api_response["properties"]
+
+
+def test_api_register_validates_and_returns_public_user(client: TestClient) -> None:
+    missing_field = client.post(
+        "/api/register",
+        json={
+            "full_name": "",
+            "email": "taylor@example.com",
+            "password": "secure1",
+            "phone": "555-0100",
+            "state": "California",
+            "terms": True,
+        },
+    )
+    assert missing_field.status_code == 422
+    assert missing_field.json()["detail"] == "Field is required."
+
+    invalid_terms = client.post(
+        "/api/register",
+        json={
+            "full_name": "Taylor",
+            "email": "taylor@example.com",
+            "password": "secure1",
+            "phone": "555-0100",
+            "state": "California",
+            "terms": False,
+        },
+    )
+    assert invalid_terms.status_code == 422
+    assert (
+        invalid_terms.json()["detail"]
+        == "You must accept the terms and conditions to register."
+    )
+
+    response = client.post(
+        "/api/register",
+        json={
+            "full_name": "Taylor Driver",
+            "email": "taylor@example.com",
+            "password": "secure1",
+            "phone": "555-0100",
+            "state": "California",
+            "terms": True,
+        },
+    )
+    assert response.status_code == 201
+    assert response.json()["user"]["email"] == "taylor@example.com"
+    assert "password_hash" not in response.json()["user"]
+    profile = client.get("/api/me")
+    assert profile.status_code == 200
+    assert "password_hash" not in profile.json()
+
+
+def test_api_login_starts_session_and_uses_shared_lockout_logic(
+    client: TestClient,
+) -> None:
+    response = client.post(
+        "/api/login",
+        json={
+            "email": "member@example.com",
+            "password": "wrong-password",
+            "captcha": "test-token",
+        },
+    )
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Incorrect email or password."
+
+    response = client.post(
+        "/api/login",
+        json={
+            "email": "member@example.com",
+            "password": "Original-Passphrase-24",
+            "captcha": "test-token",
+        },
+    )
+    assert response.status_code == 200
+    assert "password_hash" not in response.json()["user"]
+    assert client.get("/api/me").status_code == 200
+
+
+def test_api_forgot_and_reset_password(client: TestClient, caplog) -> None:
+    response = client.post(
+        "/api/forgot-password", json={"email": "member@example.com"}
+    )
+    assert response.status_code == 200
+    assert "If an account matches that email" in response.json()["message"]
+    token_match = re.search(
+        r"password reset link for member@example.com: http://\S+token=([^\s]+)",
+        caplog.text,
+    )
+    assert token_match
+
+    response = client.post(
+        "/api/reset-password",
+        json={
+            "token": token_match.group(1),
+            "password": "Reset-Password-24680",
+            "confirm_password": "Reset-Password-24680",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["message"] == "Password updated. Sign in with your new password."
+
+
+def test_api_change_password_requires_session_and_changes_password(
+    client: TestClient,
+) -> None:
+    change_payload = {
+        "current_password": "Original-Passphrase-24",
+        "password": "Changed-Password-24680",
+        "confirm_password": "Changed-Password-24680",
+    }
+    response = client.post("/api/change-password", json=change_payload)
+    assert response.status_code == 401
+
+    login = client.post(
+        "/api/login",
+        json={
+            "email": "member@example.com",
+            "password": "Original-Passphrase-24",
+            "captcha": "test-token",
+        },
+    )
+    assert login.status_code == 200
+    response = client.post("/api/change-password", json=change_payload)
+    assert response.status_code == 200
+    assert response.json()["message"] == "Password updated. Sign in again with your new password."
+    assert client.get("/api/me").status_code == 401
 
 
 def registration_data(page_text: str, **overrides: str) -> dict[str, str]:
@@ -184,6 +464,73 @@ def test_google_registration_prefills_identity_and_uses_session_email(
     assert main.get_user("google@example.com") is not None
     assert main.get_user("attacker@example.com") is None
     assert "Welcome, Google Member!" in client.get("/?welcome=1").text
+
+
+def test_google_signup_setup_fallback_returns_to_registration(
+    client: TestClient, monkeypatch
+) -> None:
+    monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("GOOGLE_CLIENT_SECRET", raising=False)
+
+    page = client.get("/register")
+    assert 'href="/auth/google?flow=signup"' in page.text
+
+    response = client.get("/auth/google?flow=signup", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/register?message=")
+
+    register = client.get(response.headers["location"])
+    assert "Google sign-in is not configured yet." in register.text
+
+
+def test_google_signup_oauth_handoff_to_registration(
+    client: TestClient, monkeypatch
+) -> None:
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "test-client-id")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "test-client-secret")
+
+    class GoogleClient:
+        async def authorize_redirect(self, request, redirect_uri: str):
+            assert redirect_uri.endswith("/auth/google/callback")
+            return main.RedirectResponse(
+                "https://accounts.google.com/o/oauth2/auth"
+            )
+
+        async def authorize_access_token(self, request):
+            return {
+                "userinfo": {
+                    "email": "new-google@example.com",
+                    "email_verified": True,
+                    "name": "New Google Member",
+                }
+            }
+
+    monkeypatch.setattr(main.oauth, "google", GoogleClient(), raising=False)
+    start = client.get("/auth/google?flow=signup", follow_redirects=False)
+    assert start.status_code == 307
+    assert start.headers["location"] == "https://accounts.google.com/o/oauth2/auth"
+
+    callback = client.get("/auth/google/callback", follow_redirects=False)
+    assert callback.status_code == 303
+    assert callback.headers["location"] == "/register"
+
+    registration = client.get("/register")
+    assert 'value="New Google Member"' in registration.text
+    assert 'value="new-google@example.com" readonly' in registration.text
+
+
+def test_google_login_setup_fallback_returns_to_sign_in(
+    client: TestClient, monkeypatch
+) -> None:
+    monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("GOOGLE_CLIENT_SECRET", raising=False)
+
+    page = client.get("/login")
+    assert 'href="/auth/google?flow=login"' in page.text
+
+    response = client.get("/auth/google?flow=login", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/login?message=")
 
 
 def test_google_sign_in_logs_in_existing_account(
